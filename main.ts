@@ -23,7 +23,7 @@
  * 5. On call end: Report duration and transcript to backend
  */
 
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const BUILD_DATE = "2025-01-28";
 
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
@@ -343,6 +343,10 @@ async function handleProviderConnection(
   const transcriptMessages: TranscriptMessage[] = [];
   let audioFrameCount = 0; // Debug: count audio frames sent
 
+  // Session state - CRITICAL: don't send audio until OpenAI session is ready
+  let sessionReady = false;
+  const pendingAudioFrames: string[] = []; // Buffer audio while waiting for session
+
   // Determine if using ElevenLabs (will be set after agent loads)
   let useElevenLabs = false;
   let elevenLabsVoiceId = "JBFqnCBsd6RMkjVDRZzb";
@@ -438,10 +442,40 @@ async function handleProviderConnection(
       switch (data.type) {
         case "session.created":
           console.log("[OpenAI] Session created");
+          // Mark session as ready
+          sessionReady = true;
+          // Flush any buffered audio frames
+          if (pendingAudioFrames.length > 0) {
+            console.log(`[Relay] Flushing ${pendingAudioFrames.length} buffered audio frames`);
+            for (const audioPayload of pendingAudioFrames) {
+              const audioEvent = {
+                type: "input_audio_buffer.append",
+                audio: audioPayload,
+              };
+              openAISocket!.send(JSON.stringify(audioEvent));
+            }
+            pendingAudioFrames.length = 0; // Clear buffer
+          }
           break;
 
         case "session.updated":
           console.log("[OpenAI] Session updated");
+          // Also mark ready on session.updated (belt and suspenders)
+          if (!sessionReady) {
+            sessionReady = true;
+            // Flush any buffered audio frames
+            if (pendingAudioFrames.length > 0) {
+              console.log(`[Relay] Flushing ${pendingAudioFrames.length} buffered audio frames`);
+              for (const audioPayload of pendingAudioFrames) {
+                const audioEvent = {
+                  type: "input_audio_buffer.append",
+                  audio: audioPayload,
+                };
+                openAISocket!.send(JSON.stringify(audioEvent));
+              }
+              pendingAudioFrames.length = 0;
+            }
+          }
           // Send greeting after session is properly configured
           if (agentConfig!.greeting && streamId) {
             sendGreeting();
@@ -624,8 +658,8 @@ async function handleProviderConnection(
       case "media":
         // Forward audio to OpenAI - payload location may differ
         const audioPayload = rawData.media?.payload || msg.audioPayload;
-        if (openAISocket && openAISocket.readyState === NodeWebSocket.OPEN && audioPayload) {
-          // Validate that audioPayload is a valid base64 string (no special chars that break JSON)
+        if (audioPayload) {
+          // Validate that audioPayload is a valid base64 string
           if (typeof audioPayload !== "string") {
             console.warn("[Relay] Invalid audio payload type:", typeof audioPayload);
             break;
@@ -635,7 +669,7 @@ async function handleProviderConnection(
           
           // Log first audio frame for debugging
           if (audioFrameCount === 1) {
-            console.log(`[Relay] First audio frame - length: ${audioPayload.length}, preview: ${audioPayload.substring(0, 50)}...`);
+            console.log(`[Relay] First audio frame - length: ${audioPayload.length}, sessionReady: ${sessionReady}`);
           }
           
           // Log every 100th frame to track progress without flooding logs
@@ -643,12 +677,22 @@ async function handleProviderConnection(
             console.log(`[Relay] Audio frames sent: ${audioFrameCount}`);
           }
           
-          const audioEvent = {
-            type: "input_audio_buffer.append",
-            audio: audioPayload,
-          };
-          
-          openAISocket.send(JSON.stringify(audioEvent));
+          // CRITICAL: Only send audio if session is ready, otherwise buffer it
+          if (sessionReady && openAISocket && openAISocket.readyState === NodeWebSocket.OPEN) {
+            const audioEvent = {
+              type: "input_audio_buffer.append",
+              audio: audioPayload,
+            };
+            openAISocket.send(JSON.stringify(audioEvent));
+          } else {
+            // Buffer audio until session is ready (limit buffer to prevent memory issues)
+            if (pendingAudioFrames.length < 500) {
+              pendingAudioFrames.push(audioPayload);
+            }
+            if (audioFrameCount === 1) {
+              console.log(`[Relay] Buffering audio - session not ready yet`);
+            }
+          }
         }
         break;
 
