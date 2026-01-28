@@ -82,22 +82,51 @@ interface ProviderMessage {
   customParams?: Record<string, string>;
 }
 
-// Load agent configuration from Supabase
+// Load agent configuration via secure Edge Function proxy (bypasses RLS)
 async function loadAgentConfig(agentId: string): Promise<AgentConfig | null> {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
-  const { data, error } = await supabase
-    .from("agents")
-    .select("*")
-    .eq("id", agentId)
-    .single();
-
-  if (error || !data) {
-    console.error("Error loading agent:", error);
+  if (!SUPABASE_URL || !RELAY_SHARED_SECRET) {
+    console.error("[Relay] Cannot load agent: missing SUPABASE_URL or RELAY_SHARED_SECRET");
     return null;
   }
 
-  return data as AgentConfig;
+  try {
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/relay-agent-config`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-relay-secret": RELAY_SHARED_SECRET,
+      },
+      body: JSON.stringify({ agentId }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      console.error("[Relay] Agent config fetch failed:", response.status, errorData);
+      return null;
+    }
+
+    const data = await response.json();
+    console.log("[Relay] Loaded agent via proxy:", data.name);
+
+    // Map the Edge Function response to our AgentConfig interface
+    return {
+      id: data.id,
+      name: data.name,
+      voice: data.voice,
+      voice_provider: data.voiceProvider,
+      elevenlabs_voice_id: data.elevenlabsVoiceId,
+      elevenlabs_model: data.elevenlabsModel,
+      system_prompt: data.systemPrompt,
+      greeting: data.greeting,
+      temperature: data.temperature,
+      vad_threshold: data.vadThreshold,
+      silence_duration_ms: data.silenceDurationMs,
+      prefix_padding_ms: data.prefixPaddingMs,
+    };
+  } catch (error) {
+    console.error("[Relay] Error loading agent config:", error);
+    return null;
+  }
 }
 
 // Update call log via backend function
