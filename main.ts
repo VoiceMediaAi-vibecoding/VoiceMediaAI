@@ -21,6 +21,7 @@
  */
 
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
+import { WebSocket as NodeWebSocket } from "npm:ws@8.18.0";
 
 // Environment variables
 // NOTE: avoid non-null assertions for optional integrations to prevent relay crashes.
@@ -46,22 +47,25 @@ if (!RELAY_SHARED_SECRET) {
 // OpenAI Realtime API configuration
 const OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
 
-// Deno WebSocket helper: OpenAI requires Authorization headers, so we must use Deno.connectWebSocket
-async function connectOpenAIRealtime(): Promise<WebSocket> {
-  const { socket, response } = await Deno.connectWebSocket({
-    url: OPENAI_REALTIME_URL,
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
+// Connect to OpenAI Realtime using npm:ws (supports custom headers)
+function connectOpenAIRealtime(): Promise<NodeWebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new NodeWebSocket(OPENAI_REALTIME_URL, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    });
+
+    ws.once("open", () => {
+      console.log("[OpenAI] WebSocket connected via npm:ws");
+      resolve(ws);
+    });
+
+    ws.once("error", (err: Error) => {
+      reject(err);
+    });
   });
-
-  if (response.status !== 101) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`[OpenAI] WebSocket upgrade failed: ${response.status} ${body}`);
-  }
-
-  return socket;
 }
 
 // Supported providers
@@ -324,7 +328,7 @@ async function handleProviderConnection(
   let callLogId = initialCallLogId;
   let provider = initialProvider;
   let agentConfig: AgentConfig | null = null;
-  let openAISocket: WebSocket | null = null;
+  let openAISocket: NodeWebSocket | null = null;
   let streamId = "";
   let audioBuffer: string[] = [];
 
@@ -382,44 +386,34 @@ async function handleProviderConnection(
       return;
     }
 
-    // Handle OpenAI connection
-    openAISocket.onopen = () => {
-      console.log("[OpenAI] Connected");
-
-      // Configure session based on voice provider
-      const sessionConfig = {
-        type: "session.update",
-        session: {
-          modalities: useElevenLabs ? ["text"] : ["text", "audio"],
-          instructions: agentConfig!.system_prompt || "You are a helpful assistant.",
-          voice: useElevenLabs ? "alloy" : agentConfig!.voice,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: {
-            model: "whisper-1",
-          },
-          turn_detection: {
-            type: "server_vad",
-            threshold: agentConfig!.vad_threshold ?? 0.6,
-            prefix_padding_ms: agentConfig!.prefix_padding_ms ?? 400,
-            silence_duration_ms: agentConfig!.silence_duration_ms ?? 800,
-          },
-          temperature: agentConfig!.temperature ?? 0.8,
+    // Configure session immediately since we connected via promise
+    const sessionConfig = {
+      type: "session.update",
+      session: {
+        modalities: useElevenLabs ? ["text"] : ["text", "audio"],
+        instructions: agentConfig!.system_prompt || "You are a helpful assistant.",
+        voice: useElevenLabs ? "alloy" : agentConfig!.voice,
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        input_audio_transcription: {
+          model: "whisper-1",
         },
-      };
-
-      openAISocket!.send(JSON.stringify(sessionConfig));
-      console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
-
-      // Send greeting immediately after session is configured
-      if (agentConfig!.greeting && streamId) {
-        sendGreeting();
-      }
+        turn_detection: {
+          type: "server_vad",
+          threshold: agentConfig!.vad_threshold ?? 0.6,
+          prefix_padding_ms: agentConfig!.prefix_padding_ms ?? 400,
+          silence_duration_ms: agentConfig!.silence_duration_ms ?? 800,
+        },
+        temperature: agentConfig!.temperature ?? 0.8,
+      },
     };
 
-    // Handle OpenAI messages
-    openAISocket.onmessage = async (event) => {
-      const data = JSON.parse(event.data as string);
+    openAISocket.send(JSON.stringify(sessionConfig));
+    console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
+
+    // Handle OpenAI messages using Node.js EventEmitter pattern
+    openAISocket.on("message", async (rawData: Buffer | string) => {
+      const data = JSON.parse(rawData.toString());
 
       switch (data.type) {
         case "session.created":
@@ -511,15 +505,15 @@ async function handleProviderConnection(
             console.log(`[OpenAI] ${data.type}:`, data.transcript || data);
           }
       }
-    };
+    });
 
-    openAISocket.onerror = (error) => {
+    openAISocket.on("error", (error: Error) => {
       console.error("[OpenAI] WebSocket error:", error);
-    };
+    });
 
-    openAISocket.onclose = () => {
+    openAISocket.on("close", () => {
       console.log("[OpenAI] Connection closed");
-    };
+    });
   };
 
   // Function to send greeting
@@ -544,7 +538,7 @@ async function handleProviderConnection(
         streamId,
         provider
       );
-    } else if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
+    } else if (openAISocket && openAISocket.readyState === NodeWebSocket.OPEN) {
       const greetingEvent = {
         type: "response.create",
         response: {
@@ -610,7 +604,7 @@ async function handleProviderConnection(
       case "media":
         // Forward audio to OpenAI - payload location may differ
         const audioPayload = rawData.media?.payload || msg.audioPayload;
-        if (openAISocket && openAISocket.readyState === WebSocket.OPEN && audioPayload) {
+        if (openAISocket && openAISocket.readyState === NodeWebSocket.OPEN && audioPayload) {
           const audioEvent = {
             type: "input_audio_buffer.append",
             audio: audioPayload,
