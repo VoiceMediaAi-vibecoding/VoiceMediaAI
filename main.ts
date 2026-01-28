@@ -24,12 +24,25 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 
 // Environment variables
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
-const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY")!;
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
-const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET")!;
+// NOTE: avoid non-null assertions for optional integrations to prevent relay crashes.
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") || "";
+const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY") || "";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || "";
+const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET") || "";
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
+
+if (!OPENAI_API_KEY) {
+  console.error("[Relay] Missing OPENAI_API_KEY – relay cannot start properly.");
+}
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error("[Relay] Missing SUPABASE_URL or SUPABASE_ANON_KEY – agent loading will fail.");
+}
+
+if (!RELAY_SHARED_SECRET) {
+  console.warn("[Relay] Missing RELAY_SHARED_SECRET – call log updates may fail.");
+}
 
 // OpenAI Realtime API configuration
 const OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
@@ -141,6 +154,10 @@ async function streamElevenLabsSpeech(
   streamId: string,
   provider: Provider
 ): Promise<void> {
+  if (!ELEVENLABS_API_KEY) {
+    console.error("[ElevenLabs] ELEVENLABS_API_KEY is not set; cannot synthesize speech.");
+    return;
+  }
   console.log(`[ElevenLabs] Generating speech for: "${text.substring(0, 50)}..."`);
   
   const response = await fetch(
@@ -291,13 +308,27 @@ async function handleProviderConnection(
   const initializeOpenAI = async () => {
     if (!agentConfig) return;
 
-    useElevenLabs = agentConfig.voice_provider === "elevenlabs" || agentConfig.voice_provider === "custom";
+    const wantsElevenLabs = agentConfig.voice_provider === "elevenlabs" || agentConfig.voice_provider === "custom";
+    // If ElevenLabs is configured on the agent but the relay is missing the API key,
+    // fall back to OpenAI audio so calls don't hard-fail.
+    useElevenLabs = wantsElevenLabs && Boolean(ELEVENLABS_API_KEY);
     elevenLabsVoiceId = agentConfig.elevenlabs_voice_id || "JBFqnCBsd6RMkjVDRZzb";
     elevenLabsModel = agentConfig.elevenlabs_model || "eleven_turbo_v2_5";
+
+    if (wantsElevenLabs && !ELEVENLABS_API_KEY) {
+      console.warn(
+        "[Relay] Agent is set to ElevenLabs/custom but ELEVENLABS_API_KEY is missing in Railway. Falling back to OpenAI audio."
+      );
+    }
 
     console.log(`[Relay] Agent loaded: ${agentConfig.name}, provider: ${agentConfig.voice_provider}`);
 
     // Connect to OpenAI Realtime API
+    if (!OPENAI_API_KEY) {
+      console.error("[Relay] Cannot connect to OpenAI Realtime: OPENAI_API_KEY missing");
+      return;
+    }
+
     openAISocket = new WebSocket(OPENAI_REALTIME_URL, {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
