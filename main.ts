@@ -8,8 +8,222 @@ const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Realtime Relay Server v4.1.0 starting on port ${PORT}...`);
+console.log(`🚀 Realtime Relay Server v5.0.0 starting on port ${PORT}...`);
 
+// ============ LOCAL VAD IMPLEMENTATION ============
+// G.711 μ-law decode table (standard ITU-T G.711)
+const ULAW_DECODE_TABLE: Int16Array = new Int16Array([
+  -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
+  -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
+  -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
+  -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
+  -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
+  -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
+  -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
+  -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
+  -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
+  -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
+  -876, -844, -812, -780, -748, -716, -684, -652,
+  -620, -588, -556, -524, -492, -460, -428, -396,
+  -372, -356, -340, -324, -308, -292, -276, -260,
+  -244, -228, -212, -196, -180, -164, -148, -132,
+  -120, -112, -104, -96, -88, -80, -72, -64,
+  -56, -48, -40, -32, -24, -16, -8, 0,
+  32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
+  23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
+  15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
+  11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
+  7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
+  5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
+  3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
+  2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
+  1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
+  1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
+  876, 844, 812, 780, 748, 716, 684, 652,
+  620, 588, 556, 524, 492, 460, 428, 396,
+  372, 356, 340, 324, 308, 292, 276, 260,
+  244, 228, 212, 196, 180, 164, 148, 132,
+  120, 112, 104, 96, 88, 80, 72, 64,
+  56, 48, 40, 32, 24, 16, 8, 0
+]);
+
+interface VADConfig {
+  silenceThresholdDb: number;    // dB threshold (e.g., -40)
+  silenceDurationMs: number;     // ms of silence to stop (e.g., 800)
+  prefixBufferMs: number;        // ms of audio to include before voice (e.g., 300)
+  sampleRate: number;            // Sample rate (8000 for telephony)
+}
+
+class LocalVAD {
+  private config: VADConfig;
+  private audioBuffer: string[] = [];
+  private silenceStartTime: number | null = null;
+  private isSpeaking: boolean = false;
+  private maxBufferChunks: number;
+  private samplesPerChunk: number = 160; // 20ms at 8kHz
+  
+  // Stats for logging
+  private totalChunksReceived: number = 0;
+  private totalChunksSent: number = 0;
+  
+  constructor(config: Partial<VADConfig> = {}) {
+    this.config = {
+      silenceThresholdDb: config.silenceThresholdDb ?? -40,
+      silenceDurationMs: config.silenceDurationMs ?? 800,
+      prefixBufferMs: config.prefixBufferMs ?? 300,
+      sampleRate: config.sampleRate ?? 8000,
+    };
+    
+    // Calculate max buffer chunks: prefixBufferMs worth of 20ms chunks
+    const chunkDurationMs = (this.samplesPerChunk / this.config.sampleRate) * 1000;
+    this.maxBufferChunks = Math.ceil(this.config.prefixBufferMs / chunkDurationMs);
+    
+    console.log(`[VAD] Initialized: threshold=${this.config.silenceThresholdDb}dB, silence=${this.config.silenceDurationMs}ms, prefix=${this.config.prefixBufferMs}ms`);
+  }
+  
+  private decodeUlaw(base64Audio: string): Int16Array {
+    const binaryString = atob(base64Audio);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    const pcm = new Int16Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) {
+      pcm[i] = ULAW_DECODE_TABLE[bytes[i]];
+    }
+    return pcm;
+  }
+  
+  private calculateRmsDb(pcm: Int16Array): number {
+    if (pcm.length === 0) return -Infinity;
+    
+    let sum = 0;
+    for (let i = 0; i < pcm.length; i++) {
+      sum += pcm[i] * pcm[i];
+    }
+    const rms = Math.sqrt(sum / pcm.length);
+    
+    // Normalize to dB (relative to max 16-bit value)
+    if (rms === 0) return -Infinity;
+    return 20 * Math.log10(rms / 32768);
+  }
+  
+  processChunk(base64Audio: string): { shouldSend: boolean; chunks: string[] } {
+    this.totalChunksReceived++;
+    
+    // Decode and analyze
+    const pcm = this.decodeUlaw(base64Audio);
+    const rmsDb = this.calculateRmsDb(pcm);
+    
+    const now = Date.now();
+    const hasVoice = rmsDb >= this.config.silenceThresholdDb;
+    
+    // Add to rolling buffer (always, for prefix padding)
+    this.audioBuffer.push(base64Audio);
+    if (this.audioBuffer.length > this.maxBufferChunks) {
+      this.audioBuffer.shift();
+    }
+    
+    let chunksToSend: string[] = [];
+    let shouldSend = false;
+    
+    if (hasVoice) {
+      // Voice detected
+      if (!this.isSpeaking) {
+        // Transition from silence to speaking
+        this.isSpeaking = true;
+        this.silenceStartTime = null;
+        
+        // Send prefix buffer (audio before speech started)
+        chunksToSend = [...this.audioBuffer];
+        this.totalChunksSent += chunksToSend.length;
+        
+        console.log(`[VAD] Voice started at ${rmsDb.toFixed(1)}dB, sending ${chunksToSend.length} prefix chunks`);
+      } else {
+        // Continuing to speak
+        chunksToSend = [base64Audio];
+        this.totalChunksSent++;
+      }
+      shouldSend = true;
+    } else {
+      // Silence detected
+      if (this.isSpeaking) {
+        // Still might be speaking (short pause)
+        if (!this.silenceStartTime) {
+          this.silenceStartTime = now;
+        }
+        
+        const silenceDuration = now - this.silenceStartTime;
+        
+        if (silenceDuration < this.config.silenceDurationMs) {
+          // Short pause, keep sending
+          chunksToSend = [base64Audio];
+          this.totalChunksSent++;
+          shouldSend = true;
+        } else {
+          // Long silence, stop sending
+          this.isSpeaking = false;
+          this.silenceStartTime = null;
+          
+          const reduction = this.totalChunksReceived > 0 
+            ? ((1 - this.totalChunksSent / this.totalChunksReceived) * 100).toFixed(1)
+            : '0';
+          console.log(`[VAD] Voice ended. Stats: received=${this.totalChunksReceived}, sent=${this.totalChunksSent} (${reduction}% reduction)`);
+        }
+      }
+      // If not speaking and silence, don't send anything (filtered out)
+    }
+    
+    return { shouldSend, chunks: chunksToSend };
+  }
+  
+  getStats(): { received: number; sent: number; reductionPercent: number } {
+    const reductionPercent = this.totalChunksReceived > 0 
+      ? (1 - this.totalChunksSent / this.totalChunksReceived) * 100
+      : 0;
+    return {
+      received: this.totalChunksReceived,
+      sent: this.totalChunksSent,
+      reductionPercent,
+    };
+  }
+  
+  reset() {
+    this.audioBuffer = [];
+    this.silenceStartTime = null;
+    this.isSpeaking = false;
+  }
+}
+
+// ============ TOKEN USAGE TRACKING ============
+interface UsageMetrics {
+  inputTokens: number;
+  outputTokens: number;
+  audioInputTokens: number;
+  audioOutputTokens: number;
+  textInputTokens: number;
+  textOutputTokens: number;
+}
+
+// OpenAI Realtime API pricing (January 2025)
+const PRICING = {
+  AUDIO_INPUT_PER_TOKEN: 0.0001,    // $100/1M tokens
+  AUDIO_OUTPUT_PER_TOKEN: 0.0002,   // $200/1M tokens
+  TEXT_INPUT_PER_TOKEN: 0.000005,   // $5/1M tokens
+  TEXT_OUTPUT_PER_TOKEN: 0.00002,   // $20/1M tokens
+};
+
+function calculateCost(usage: UsageMetrics): number {
+  return (
+    usage.audioInputTokens * PRICING.AUDIO_INPUT_PER_TOKEN +
+    usage.audioOutputTokens * PRICING.AUDIO_OUTPUT_PER_TOKEN +
+    usage.textInputTokens * PRICING.TEXT_INPUT_PER_TOKEN +
+    usage.textOutputTokens * PRICING.TEXT_OUTPUT_PER_TOKEN
+  );
+}
+
+// ============ AGENT CONFIG ============
 async function loadAgentConfig(agentId: string) {
   const defaultConfig = {
     systemPrompt: "You are a helpful AI assistant for phone calls. Respond in Spanish. Be concise and helpful.",
@@ -21,6 +235,9 @@ async function loadAgentConfig(agentId: string) {
     greeting: null as string | null,
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
+    vadThreshold: -40,
+    silenceDurationMs: 800,
+    prefixPaddingMs: 300,
   };
 
   try {
@@ -59,6 +276,9 @@ async function loadAgentConfig(agentId: string) {
       greeting: data.greeting || null,
       whisperLanguage: data.whisperLanguage || "es",
       whisperPrompt: data.whisperPrompt || null,
+      vadThreshold: data.vadThreshold ?? defaultConfig.vadThreshold,
+      silenceDurationMs: data.silenceDurationMs ?? defaultConfig.silenceDurationMs,
+      prefixPaddingMs: data.prefixPaddingMs ?? defaultConfig.prefixPaddingMs,
     };
   } catch (e) {
     console.error("[AGENT] Error fetching agent config:", e);
@@ -88,15 +308,31 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
     greeting: null as string | null,
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
+    vadThreshold: -40,
+    silenceDurationMs: 800,
+    prefixPaddingMs: 300,
   };
   let useElevenLabs = false;
   let audioBuffer: string[] = [];
   let twilioPlaybackToken = 0;
   
+  // Local VAD instance
+  let localVAD: LocalVAD | null = null;
+  
   // Call tracking variables
   let callStartTime: number | null = null;
   let callLogId: string | null = null;
   let conversationTranscript: { role: string; text: string }[] = [];
+  
+  // Token usage tracking
+  let usageMetrics: UsageMetrics = {
+    inputTokens: 0,
+    outputTokens: 0,
+    audioInputTokens: 0,
+    audioOutputTokens: 0,
+    textInputTokens: 0,
+    textOutputTokens: 0,
+  };
   
   // Multi-provider support
   let provider: Provider = urlParams.provider;
@@ -136,7 +372,7 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
     }
   };
 
-  // Finalize call - send transcript and duration to update-call-log
+  // Finalize call - send transcript, duration, and usage metrics to update-call-log
   const finalizeCall = async () => {
     if (!callLogId) {
       console.log("[TRACKING] No callLogId, skipping finalization");
@@ -151,7 +387,19 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
       .map(m => `${m.role}: ${m.text}`)
       .join('\n');
 
-    console.log(`[TRACKING] Finalizing call ${callLogId}: ${duration}s, ${conversationTranscript.length} messages`);
+    // Calculate estimated cost
+    const estimatedCost = calculateCost(usageMetrics);
+    
+    // Get VAD stats
+    const vadStats = localVAD?.getStats() || { received: 0, sent: 0, reductionPercent: 0 };
+
+    console.log(`[TRACKING] Finalizing call ${callLogId}:`);
+    console.log(`  Duration: ${duration}s, Messages: ${conversationTranscript.length}`);
+    console.log(`  Tokens - Input: ${usageMetrics.inputTokens}, Output: ${usageMetrics.outputTokens}`);
+    console.log(`  Audio Input: ${usageMetrics.audioInputTokens}, Audio Output: ${usageMetrics.audioOutputTokens}`);
+    console.log(`  Text Input: ${usageMetrics.textInputTokens}, Text Output: ${usageMetrics.textOutputTokens}`);
+    console.log(`  Estimated Cost: $${estimatedCost.toFixed(4)}`);
+    console.log(`  VAD Reduction: ${vadStats.reductionPercent.toFixed(1)}% (${vadStats.sent}/${vadStats.received} chunks)`);
 
     try {
       const response = await fetch(`${SUPABASE_URL}/functions/v1/update-call-log`, {
@@ -166,6 +414,16 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           transcript: transcript,
           status: 'completed',
           ended_at: new Date().toISOString(),
+          usage: {
+            input_tokens: usageMetrics.inputTokens,
+            output_tokens: usageMetrics.outputTokens,
+            audio_input_tokens: usageMetrics.audioInputTokens,
+            audio_output_tokens: usageMetrics.audioOutputTokens,
+            text_input_tokens: usageMetrics.textInputTokens,
+            text_output_tokens: usageMetrics.textOutputTokens,
+            estimated_cost: estimatedCost,
+            vad_reduction_percent: vadStats.reductionPercent,
+          },
         }),
       });
 
@@ -287,6 +545,14 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           // Twilio: customParameters; Telnyx: we pass callLogId in WS URL
           callLogId = callLogId || data?.start?.customParameters?.call_log_id || data?.start?.customParameters?.callLogId || null;
           conversationTranscript = [];
+          usageMetrics = {
+            inputTokens: 0,
+            outputTokens: 0,
+            audioInputTokens: 0,
+            audioOutputTokens: 0,
+            textInputTokens: 0,
+            textOutputTokens: 0,
+          };
           
           console.log(`[${provider.toUpperCase()}] Stream started - SID: ${streamSid}, Call: ${callSid}`);
           console.log(`[TRACKING] Call log ID: ${callLogId || 'none'}, Start time: ${new Date(callStartTime).toISOString()}`);
@@ -298,6 +564,13 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           agentConfig = await loadAgentConfig(effectiveAgentId);
           useElevenLabs = agentConfig.voiceProvider === "elevenlabs" || agentConfig.voiceProvider === "custom";
           console.log(`[TTS] Using ${useElevenLabs ? "ElevenLabs" : "OpenAI"}`);
+          
+          // Initialize local VAD with agent config
+          localVAD = new LocalVAD({
+            silenceThresholdDb: agentConfig.vadThreshold,
+            silenceDurationMs: agentConfig.silenceDurationMs,
+            prefixBufferMs: agentConfig.prefixPaddingMs,
+          });
 
           // Connect to OpenAI Realtime API using native Deno WebSocket
           const openAIUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
@@ -322,6 +595,7 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
               console.log(`[WHISPER] Using prompt: "${agentConfig.whisperPrompt.substring(0, 50)}..."`);
             }
 
+            // IMPORTANT: modalities is ["text"] for ElevenLabs to prevent audio_output_tokens
             const sessionConfig = {
               type: "session.update",
               session: {
@@ -336,7 +610,7 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
             };
 
             openAIWs?.send(JSON.stringify(sessionConfig));
-            console.log(`[OPENAI] Session config sent`);
+            console.log(`[OPENAI] Session config sent (modalities: ${useElevenLabs ? '["text"]' : '["text", "audio"]'})`);
           };
 
           openAIWs.onmessage = (msg) => {
@@ -375,6 +649,27 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
                   }
                 }
               } else if (response.type === 'response.done') {
+                // CRITICAL: Capture usage metrics from response.done
+                if (response.response?.usage) {
+                  const usage = response.response.usage;
+                  
+                  usageMetrics.inputTokens += usage.input_tokens || 0;
+                  usageMetrics.outputTokens += usage.output_tokens || 0;
+                  
+                  // Detailed token breakdown
+                  if (usage.input_token_details) {
+                    usageMetrics.audioInputTokens += usage.input_token_details.audio_tokens || 0;
+                    usageMetrics.textInputTokens += usage.input_token_details.text_tokens || 0;
+                  }
+                  if (usage.output_token_details) {
+                    usageMetrics.audioOutputTokens += usage.output_token_details.audio_tokens || 0;
+                    usageMetrics.textOutputTokens += usage.output_token_details.text_tokens || 0;
+                  }
+                  
+                  console.log(`[USAGE] Input: ${usage.input_tokens} (audio: ${usage.input_token_details?.audio_tokens || 0}, text: ${usage.input_token_details?.text_tokens || 0})`);
+                  console.log(`[USAGE] Output: ${usage.output_tokens} (audio: ${usage.output_token_details?.audio_tokens || 0}, text: ${usage.output_token_details?.text_tokens || 0})`);
+                }
+                
                 // Fallback for any remaining audio buffer
                 if (useElevenLabs && audioBuffer.length > 0) {
                   const fullText = audioBuffer.join('');
@@ -401,7 +696,7 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
                   console.log(`[TRANSCRIPT] Agent: "${response.transcript.substring(0, 50)}..."`);
                 }
               } else if (response.type === 'input_audio_buffer.speech_started') {
-                console.log("[VAD] User speaking");
+                console.log("[VAD] User speaking (OpenAI VAD)");
                 twilioPlaybackToken++;
                 audioBuffer = [];
                 clearCallerAudio();
@@ -418,7 +713,21 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           break;
 
         case 'media':
-          if (openAIWs && openAIWs.readyState === WebSocket.OPEN) {
+          if (openAIWs && openAIWs.readyState === WebSocket.OPEN && localVAD) {
+            // LOCAL VAD: Filter audio before sending to OpenAI
+            const vadResult = localVAD.processChunk(data.media.payload);
+            
+            if (vadResult.shouldSend) {
+              for (const chunk of vadResult.chunks) {
+                openAIWs.send(JSON.stringify({
+                  type: 'input_audio_buffer.append',
+                  audio: chunk,
+                }));
+              }
+            }
+            // If !shouldSend, audio is silence and is filtered out
+          } else if (openAIWs && openAIWs.readyState === WebSocket.OPEN) {
+            // Fallback: no local VAD, send all audio
             openAIWs.send(JSON.stringify({
               type: 'input_audio_buffer.append',
               audio: data.media.payload,
@@ -428,6 +737,23 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
 
         case 'stop':
           console.log(`[${provider.toUpperCase()}] Stream stopped`);
+          
+          // Log final usage summary
+          const cost = calculateCost(usageMetrics);
+          console.log(`[USAGE SUMMARY]`);
+          console.log(`  Total Input Tokens: ${usageMetrics.inputTokens}`);
+          console.log(`  Total Output Tokens: ${usageMetrics.outputTokens}`);
+          console.log(`  Audio Input Tokens: ${usageMetrics.audioInputTokens}`);
+          console.log(`  Audio Output Tokens: ${usageMetrics.audioOutputTokens} ${usageMetrics.audioOutputTokens === 0 ? '✅' : '⚠️'}`);
+          console.log(`  Text Input Tokens: ${usageMetrics.textInputTokens}`);
+          console.log(`  Text Output Tokens: ${usageMetrics.textOutputTokens}`);
+          console.log(`  Estimated Cost: $${cost.toFixed(4)}`);
+          
+          if (localVAD) {
+            const stats = localVAD.getStats();
+            console.log(`[VAD SUMMARY] Chunks: ${stats.sent}/${stats.received} (${stats.reductionPercent.toFixed(1)}% filtered)`);
+          }
+          
           await finalizeCall();
           cleanup();
           break;
@@ -446,7 +772,7 @@ Deno.serve({ port: PORT }, async (req) => {
   const upgradeHeader = req.headers.get("upgrade") || "";
 
   if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok", version: "4.1.0" }), { headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ status: "ok", version: "5.0.0" }), { headers: { "Content-Type": "application/json" } });
   }
 
   if (upgradeHeader.toLowerCase() === "websocket") {
@@ -459,7 +785,7 @@ Deno.serve({ port: PORT }, async (req) => {
     return response;
   }
 
-  return new Response("Realtime Relay Server v4.1.0", { status: 200 });
+  return new Response("Realtime Relay Server v5.0.0", { status: 200 });
 });
 
-console.log(`✅ Realtime Relay Server v4.1.0 running on port ${PORT}`);
+console.log(`✅ Realtime Relay Server v5.0.0 running on port ${PORT}`);
