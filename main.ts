@@ -62,7 +62,15 @@ async function loadAgentConfig(agentId: string) {
   }
 }
 
-function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
+type Provider = 'twilio' | 'telnyx';
+
+type RelayUrlParams = {
+  agentId: string | null;
+  callLogId: string | null;
+  provider: Provider;
+};
+
+function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
   let openAIWs: WebSocket | null = null;
   let streamSid: string | null = null;
   let callSid: string | null = null;
@@ -85,7 +93,35 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   let conversationTranscript: { role: string; text: string }[] = [];
   
   // Multi-provider support
-  let provider: 'twilio' | 'telnyx' = 'twilio';
+  let provider: Provider = urlParams.provider;
+
+  // Prefer URL-provided callLogId (Telnyx passes it in the WS URL)
+  callLogId = urlParams.callLogId;
+
+  const sendToCaller = (msg: Record<string, unknown>) => {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify(msg));
+  };
+
+  const sendAudioToCaller = (payloadBase64: string) => {
+    if (!streamSid) return;
+
+    // Twilio expects streamSid; Telnyx expects stream_id.
+    if (provider === 'telnyx') {
+      sendToCaller({ event: 'media', stream_id: streamSid, media: { payload: payloadBase64 } });
+    } else {
+      sendToCaller({ event: 'media', streamSid, media: { payload: payloadBase64 } });
+    }
+  };
+
+  const clearCallerAudio = () => {
+    if (!streamSid) return;
+    if (provider === 'telnyx') {
+      sendToCaller({ event: 'clear', stream_id: streamSid });
+    } else {
+      sendToCaller({ event: 'clear', streamSid });
+    }
+  };
 
   const cleanup = () => {
     if (openAIWs) {
@@ -223,31 +259,34 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
 
       switch (data.event) {
         case 'connected':
-          console.log(`[TWILIO] Connected`);
+          console.log(`[${provider.toUpperCase()}] Connected`);
           break;
 
         case 'start':
-          // Auto-detect provider based on field names
-          if (data.start?.stream_id) {
+          // Auto-detect provider based on Telnyx vs Twilio schemas
+          // Telnyx: top-level stream_id + start.call_control_id
+          // Twilio: start.streamSid + start.callSid
+          if (typeof data.stream_id === 'string' || typeof data?.start?.call_control_id === 'string') {
             provider = 'telnyx';
-            streamSid = data.start.stream_id;
-            callSid = data.start.call_control_id;
+            streamSid = (data.stream_id || data?.start?.stream_id || data?.start?.streamSid || null) as string | null;
+            callSid = (data?.start?.call_control_id || data?.start?.callSid || null) as string | null;
           } else {
             provider = 'twilio';
-            streamSid = data.start.streamSid;
-            callSid = data.start.callSid;
+            streamSid = (data?.start?.streamSid || null) as string | null;
+            callSid = (data?.start?.callSid || null) as string | null;
           }
           
           // Initialize call tracking
           callStartTime = Date.now();
-          callLogId = data?.start?.customParameters?.call_log_id || null;
+          // Twilio: customParameters; Telnyx: we pass callLogId in WS URL
+          callLogId = callLogId || data?.start?.customParameters?.call_log_id || data?.start?.customParameters?.callLogId || null;
           conversationTranscript = [];
           
           console.log(`[${provider.toUpperCase()}] Stream started - SID: ${streamSid}, Call: ${callSid}`);
           console.log(`[TRACKING] Call log ID: ${callLogId || 'none'}, Start time: ${new Date(callStartTime).toISOString()}`);
 
-          const startAgentId = data?.start?.customParameters?.agent_id || null;
-          const effectiveAgentId = (startAgentId || urlAgentId || "default").toString();
+          const startAgentId = data?.start?.customParameters?.agent_id || data?.start?.customParameters?.agentId || null;
+          const effectiveAgentId = (startAgentId || urlParams.agentId || "default").toString();
           console.log(`[AGENT] Loading config for: ${effectiveAgentId}`);
 
           agentConfig = await loadAgentConfig(effectiveAgentId);
@@ -303,13 +342,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                   },
                 }));
               } else if (response.type === 'response.audio.delta' && !useElevenLabs) {
-                if (streamSid && socket.readyState === WebSocket.OPEN) {
-                  socket.send(JSON.stringify({
-                    event: 'media',
-                    streamSid,
-                    media: { payload: response.delta },
-                  }));
-                }
+                sendAudioToCaller(response.delta);
               } else if (response.type === 'response.text.delta' && useElevenLabs) {
                 audioBuffer.push(response.delta);
               } else if (response.type === 'response.text.done') {
@@ -353,9 +386,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                 console.log("[VAD] User speaking");
                 twilioPlaybackToken++;
                 audioBuffer = [];
-                if (streamSid && socket.readyState === WebSocket.OPEN) {
-                  socket.send(JSON.stringify({ event: 'clear', streamSid }));
-                }
+                clearCallerAudio();
               } else if (response.type === 'error') {
                 console.error("[OPENAI] Error:", response.error);
               }
@@ -384,12 +415,12 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           break;
       }
     } catch (error) {
-      console.error("[TWILIO] Message error:", error);
+      console.error(`[${provider.toUpperCase()}] Message error:`, error);
     }
   };
 
-  socket.onerror = (error) => console.error("[TWILIO] WebSocket error:", error);
-  socket.onclose = () => { console.log(`[TWILIO] WebSocket closed`); cleanup(); };
+  socket.onerror = (error) => console.error(`[${provider.toUpperCase()}] WebSocket error:`, error);
+  socket.onclose = () => { console.log(`[${provider.toUpperCase()}] WebSocket closed`); cleanup(); };
 }
 
 Deno.serve({ port: PORT }, async (req) => {
@@ -401,9 +432,12 @@ Deno.serve({ port: PORT }, async (req) => {
   }
 
   if (upgradeHeader.toLowerCase() === "websocket") {
-    const urlAgentId = url.searchParams.get('agentId');
+    const agentId = url.searchParams.get('agentId');
+    const callLogId = url.searchParams.get('callLogId');
+    const providerParam = (url.searchParams.get('provider') || 'twilio').toLowerCase();
+    const provider: Provider = providerParam === 'telnyx' ? 'telnyx' : 'twilio';
     const { socket, response } = Deno.upgradeWebSocket(req);
-    handleWebSocket(socket, urlAgentId);
+    handleWebSocket(socket, { agentId, callLogId, provider });
     return response;
   }
 
