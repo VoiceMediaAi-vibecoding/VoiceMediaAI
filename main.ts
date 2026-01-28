@@ -1,24 +1,23 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
+import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 
 // Load environment variables
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
 console.log(`🚀 Realtime Relay Server starting on port ${PORT}...`);
 
-// Simple Supabase client for database operations
+// Simple Supabase client for database operations (using anon key with RLS)
 async function supabaseQuery(table: string, method: string, body?: object, filters?: string) {
   const url = `${SUPABASE_URL}/rest/v1/${table}${filters ? `?${filters}` : ''}`;
   const response = await fetch(url, {
     method,
     headers: {
-      'apikey': SUPABASE_SERVICE_ROLE_KEY!,
-      'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'apikey': SUPABASE_ANON_KEY!,
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
       'Content-Type': 'application/json',
       'Prefer': 'return=minimal',
     },
@@ -42,8 +41,8 @@ async function loadAgentConfig(agentId: string) {
       `${SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=*`,
       {
         headers: {
-          'apikey': SUPABASE_SERVICE_ROLE_KEY!,
-          'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          'apikey': SUPABASE_ANON_KEY!,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
         },
       }
     );
@@ -411,10 +410,12 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   };
 }
 
-// HTTP Server with WebSocket upgrade
-serve(async (req) => {
+// HTTP Server using modern Deno.serve API
+Deno.serve({ port: PORT }, async (req) => {
   const url = new URL(req.url);
   const upgradeHeader = req.headers.get("upgrade") || "";
+
+  console.log(`[REQUEST] ${req.method} ${url.pathname} - Upgrade: ${upgradeHeader}`);
 
   // Health check endpoint
   if (url.pathname === "/health") {
@@ -426,12 +427,14 @@ serve(async (req) => {
   // WebSocket upgrade for relay
   if (upgradeHeader.toLowerCase() === "websocket") {
     const urlAgentId = url.searchParams.get('agentId');
+    console.log(`[WEBSOCKET] Upgrading connection for agent: ${urlAgentId}`);
+    
     const { socket, response } = Deno.upgradeWebSocket(req);
     handleWebSocket(socket, urlAgentId);
     return response;
   }
 
   return new Response("Realtime Relay Server - Use WebSocket connection", { status: 200 });
-}, { port: PORT });
+});
 
 console.log(`✅ Realtime Relay Server running on port ${PORT}`);
