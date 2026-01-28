@@ -4,62 +4,58 @@ import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/b
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_ANON_KEY");
+const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
 console.log(`🚀 Realtime Relay Server starting on port ${PORT}...`);
-console.log(`[CONFIG] SUPABASE_URL: ${SUPABASE_URL}`);
-console.log(`[CONFIG] SUPABASE_KEY exists: ${!!SUPABASE_KEY}`);
-console.log(`[CONFIG] Using Service Role: ${!!Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`);
 
 async function loadAgentConfig(agentId: string) {
   const defaultConfig = {
     systemPrompt: "You are a helpful AI assistant for phone calls. Respond in Spanish. Be concise and helpful.",
     voice: "alloy",
     voiceProvider: "openai",
-    customVoiceId: null as string | null,
-    language: "es-ES",
+    elevenlabsVoiceId: null as string | null,
+    elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente Virtual",
     greeting: null as string | null,
   };
 
   try {
-    const url = `${SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=*`;
-    console.log(`[AGENT_FETCH] URL: ${url}`);
+    // Call Lovable Cloud edge function to get agent config
+    const url = `${SUPABASE_URL}/functions/v1/relay-agent-config`;
+    console.log(`[AGENT_FETCH] Calling: ${url}`);
     
     const response = await fetch(url, {
+      method: 'POST',
       headers: {
-        'apikey': SUPABASE_KEY!,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'x-relay-secret': RELAY_SHARED_SECRET!,
       },
+      body: JSON.stringify({ agentId }),
     });
     
-    const raw = await response.text();
+    const data = await response.json();
     console.log(`[AGENT_FETCH] Status: ${response.status}`);
-    console.log(`[AGENT_FETCH] Response: ${raw.substring(0, 500)}`);
     
-    const agents = JSON.parse(raw);
-    const agent = agents[0];
-    
-    if (!agent) {
-      console.log(`[AGENT] No agent found with ID ${agentId}, using defaults`);
+    if (!response.ok) {
+      console.error(`[AGENT_FETCH] Error:`, data);
       return defaultConfig;
     }
 
-    console.log(`✅ Loaded agent: ${agent.name} (${agent.id})`);
-    console.log(`   Voice Provider: ${agent.voice_provider}, Voice: ${agent.voice}`);
-    console.log(`   ElevenLabs Voice ID: ${agent.elevenlabs_voice_id}`);
-    console.log(`   Greeting: ${agent.greeting?.substring(0, 80)}...`);
+    console.log(`✅ Loaded agent: ${data.name} (${data.id})`);
+    console.log(`   Voice Provider: ${data.voiceProvider}, Voice: ${data.voice}`);
+    console.log(`   ElevenLabs Voice ID: ${data.elevenlabsVoiceId}`);
+    console.log(`   Greeting: ${data.greeting?.substring(0, 80)}...`);
 
     return {
-      systemPrompt: agent.system_prompt || defaultConfig.systemPrompt,
-      voice: agent.voice || "alloy",
-      voiceProvider: agent.voice_provider || "openai",
-      customVoiceId: agent.elevenlabs_voice_id,
-      language: agent.language || "es-ES",
-      name: agent.name || defaultConfig.name,
-      greeting: agent.greeting || null,
+      systemPrompt: data.systemPrompt || defaultConfig.systemPrompt,
+      voice: data.voice || "alloy",
+      voiceProvider: data.voiceProvider || "openai",
+      elevenlabsVoiceId: data.elevenlabsVoiceId,
+      elevenlabsModel: data.elevenlabsModel || "eleven_turbo_v2_5",
+      name: data.name || defaultConfig.name,
+      greeting: data.greeting || null,
     };
   } catch (e) {
     console.error("[AGENT] Error fetching agent config:", e);
@@ -73,13 +69,12 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   let openAIWs: WebSocket | null = null;
   let streamSid: string | null = null;
   let callSid: string | null = null;
-  let currentAgentId: string | null = null;
   let agentConfig = {
     systemPrompt: "",
     voice: "alloy",
     voiceProvider: "openai",
-    customVoiceId: null as string | null,
-    language: "es-ES",
+    elevenlabsVoiceId: null as string | null,
+    elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente",
     greeting: null as string | null,
   };
@@ -87,7 +82,6 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   let audioBuffer: string[] = [];
   let twilioPlaybackToken = 0;
   let callStartTime: number | null = null;
-  let responseStartTime: number | null = null;
 
   const cleanup = () => {
     if (openAIWs) {
@@ -97,18 +91,14 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   };
 
   const getElevenLabsVoiceId = () => {
-    if (agentConfig.voiceProvider === "custom" || agentConfig.voiceProvider === "elevenlabs") {
-      return agentConfig.customVoiceId;
-    }
-    return agentConfig.voice;
+    return agentConfig.elevenlabsVoiceId || "EXAVITQu4vr4xnSDxMaL";
   };
 
   async function streamElevenLabsSpeech(text: string): Promise<void> {
     const currentToken = ++twilioPlaybackToken;
-    const startTime = performance.now();
 
     try {
-      const voiceId = getElevenLabsVoiceId() || "EXAVITQu4vr4xnSDxMaL";
+      const voiceId = getElevenLabsVoiceId();
       console.log(`[ELEVENLABS] Starting TTS for voice: ${voiceId}`);
 
       const response = await fetch(
@@ -121,7 +111,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           },
           body: JSON.stringify({
             text,
-            model_id: "eleven_turbo_v2_5",
+            model_id: agentConfig.elevenlabsModel,
             voice_settings: { stability: 0.5, similarity_boost: 0.75 },
           }),
         }
@@ -132,16 +122,12 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
         return;
       }
 
-      console.log(`[ELEVENLABS] API response in ${Math.round(performance.now() - startTime)}ms`);
-
       const reader = response.body.getReader();
       let buffer = new Uint8Array(0);
       const CHUNK_SIZE = 160;
-      let chunksSent = 0;
 
       while (true) {
         if (currentToken !== twilioPlaybackToken) {
-          console.log("[ELEVENLABS] Cancelled due to interruption");
           reader.cancel();
           return;
         }
@@ -164,13 +150,11 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           buffer = buffer.slice(CHUNK_SIZE);
 
           if (streamSid && socket.readyState === WebSocket.OPEN) {
-            const base64Chunk = base64Encode(chunk);
             socket.send(JSON.stringify({
               event: 'media',
               streamSid,
-              media: { payload: base64Chunk },
+              media: { payload: base64Encode(chunk) },
             }));
-            chunksSent++;
           }
         }
       }
@@ -181,10 +165,9 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           streamSid,
           media: { payload: base64Encode(buffer) },
         }));
-        chunksSent++;
       }
 
-      console.log(`[ELEVENLABS] Complete: ${chunksSent} chunks in ${(performance.now() - startTime).toFixed(0)}ms`);
+      console.log(`[ELEVENLABS] TTS complete`);
     } catch (error) {
       console.error("[ELEVENLABS] Error:", error);
     }
@@ -205,17 +188,14 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           callStartTime = performance.now();
           console.log(`[TWILIO] Stream started - SID: ${streamSid}, Call: ${callSid}`);
 
-          // Get agent ID from custom parameters (Twilio sends as agent_id)
           const startAgentId = data?.start?.customParameters?.agent_id || null;
           const effectiveAgentId = (startAgentId || urlAgentId || "default").toString();
-          currentAgentId = effectiveAgentId !== "default" ? effectiveAgentId : null;
           console.log(`[AGENT] Loading config for: ${effectiveAgentId}`);
 
           agentConfig = await loadAgentConfig(effectiveAgentId);
           useElevenLabs = agentConfig.voiceProvider === "elevenlabs" || agentConfig.voiceProvider === "custom";
           console.log(`[TTS] Using ${useElevenLabs ? "ElevenLabs" : "OpenAI"}`);
 
-          // Connect to OpenAI Realtime API
           const openAIUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
           openAIWs = new WebSocket(openAIUrl, [
             "realtime",
@@ -224,13 +204,12 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           ]);
 
           openAIWs.onopen = () => {
-            console.log(`[OPENAI] Connected in ${Math.round(performance.now() - callStartTime!)}ms`);
+            console.log(`[OPENAI] Connected`);
 
-            const modalitiesConfig = useElevenLabs ? ["text"] : ["text", "audio"];
             const sessionConfig = {
               type: "session.update",
               session: {
-                modalities: modalitiesConfig,
+                modalities: useElevenLabs ? ["text"] : ["text", "audio"],
                 instructions: agentConfig.systemPrompt,
                 voice: useElevenLabs ? "alloy" : agentConfig.voice,
                 input_audio_format: "g711_ulaw",
@@ -257,13 +236,11 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
               } else if (response.type === 'session.updated') {
                 console.log(`[OPENAI] Session updated`);
 
-                // Send initial greeting using agent's configured greeting
-                responseStartTime = performance.now();
                 const greetingInstruction = agentConfig.greeting 
                   ? `Di exactamente este saludo, no agregues nada más: "${agentConfig.greeting}"`
-                  : "Saluda al usuario de forma breve y amigable. Preséntate con tu nombre y pregunta en qué puedes ayudar.";
+                  : "Saluda al usuario de forma breve y amigable.";
                 
-                console.log(`[GREETING] Instruction: ${greetingInstruction.substring(0, 100)}...`);
+                console.log(`[GREETING] ${agentConfig.greeting ? 'Using agent greeting' : 'Using default'}`);
                 
                 openAIWs?.send(JSON.stringify({
                   type: "response.create",
@@ -286,17 +263,11 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                 if (useElevenLabs && audioBuffer.length > 0) {
                   const fullText = audioBuffer.join('');
                   audioBuffer = [];
-                  console.log(`[OPENAI] Text: "${fullText.substring(0, 100)}..."`);
+                  console.log(`[OPENAI] Text: "${fullText.substring(0, 80)}..."`);
                   streamElevenLabsSpeech(fullText).catch(console.error);
                 }
-
-                if (response.type === 'response.done') {
-                  console.log(`[METRICS] Response done`);
-                  responseStartTime = null;
-                }
               } else if (response.type === 'input_audio_buffer.speech_started') {
-                console.log("[VAD] User speaking - interrupting");
-                responseStartTime = performance.now();
+                console.log("[VAD] User speaking");
                 twilioPlaybackToken++;
                 audioBuffer = [];
                 if (streamSid && socket.readyState === WebSocket.OPEN) {
@@ -308,17 +279,12 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                 console.error("[OPENAI] Error:", response.error);
               }
             } catch (e) {
-              console.error("[OPENAI] Message processing error:", e);
+              console.error("[OPENAI] Message error:", e);
             }
           };
 
-          openAIWs.onerror = (error) => {
-            console.error("[OPENAI] WebSocket error:", error);
-          };
-
-          openAIWs.onclose = (event) => {
-            console.log(`[OPENAI] WebSocket closed - Code: ${event.code}`);
-          };
+          openAIWs.onerror = (error) => console.error("[OPENAI] WebSocket error:", error);
+          openAIWs.onclose = () => console.log(`[OPENAI] WebSocket closed`);
           break;
 
         case 'media':
@@ -336,30 +302,20 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           break;
       }
     } catch (error) {
-      console.error("[TWILIO] Message processing error:", error);
+      console.error("[TWILIO] Message error:", error);
     }
   };
 
-  socket.onerror = (error) => {
-    console.error("[TWILIO] WebSocket error:", error);
-  };
-
-  socket.onclose = () => {
-    console.log(`[TWILIO] WebSocket closed`);
-    cleanup();
-  };
+  socket.onerror = (error) => console.error("[TWILIO] WebSocket error:", error);
+  socket.onclose = () => { console.log(`[TWILIO] WebSocket closed`); cleanup(); };
 }
 
 Deno.serve({ port: PORT }, async (req) => {
   const url = new URL(req.url);
   const upgradeHeader = req.headers.get("upgrade") || "";
 
-  console.log(`[REQUEST] ${req.method} ${url.pathname}`);
-
   if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok" }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(JSON.stringify({ status: "ok" }), { headers: { "Content-Type": "application/json" } });
   }
 
   if (upgradeHeader.toLowerCase() === "websocket") {
