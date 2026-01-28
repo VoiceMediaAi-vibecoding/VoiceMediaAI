@@ -312,11 +312,23 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                 }
               } else if (response.type === 'response.text.delta' && useElevenLabs) {
                 audioBuffer.push(response.delta);
-              } else if (response.type === 'response.text.done' || response.type === 'response.done') {
+              } else if (response.type === 'response.text.done') {
+                // For ElevenLabs mode: capture agent transcript from text response
+                if (useElevenLabs) {
+                  const fullText = audioBuffer.join('');
+                  audioBuffer = [];
+                  if (fullText) {
+                    conversationTranscript.push({ role: 'agent', text: fullText });
+                    console.log(`[TRANSCRIPT] Agent (text): "${fullText.substring(0, 50)}..."`);
+                    streamElevenLabsSpeech(fullText).catch(console.error);
+                  }
+                }
+              } else if (response.type === 'response.done') {
+                // Fallback for any remaining audio buffer
                 if (useElevenLabs && audioBuffer.length > 0) {
                   const fullText = audioBuffer.join('');
                   audioBuffer = [];
-                  console.log(`[OPENAI] Text: "${fullText.substring(0, 80)}..."`);
+                  console.log(`[OPENAI] Remaining text: "${fullText.substring(0, 80)}..."`);
                   streamElevenLabsSpeech(fullText).catch(console.error);
                 }
               } else if (response.type === 'input_audio_transcription.completed') {
