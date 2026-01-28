@@ -9,22 +9,9 @@ const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
 console.log(`🚀 Realtime Relay Server starting on port ${PORT}...`);
-
-// Simple Supabase client for database operations
-async function supabaseQuery(table: string, method: string, body?: object, filters?: string) {
-  const url = `${SUPABASE_URL}/rest/v1/${table}${filters ? `?${filters}` : ''}`;
-  const response = await fetch(url, {
-    method,
-    headers: {
-      'apikey': SUPABASE_KEY!,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=minimal',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return response;
-}
+console.log(`[CONFIG] SUPABASE_URL: ${SUPABASE_URL}`);
+console.log(`[CONFIG] SUPABASE_KEY exists: ${!!SUPABASE_KEY}`);
+console.log(`[CONFIG] Using Service Role: ${!!Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`);
 
 async function loadAgentConfig(agentId: string) {
   const defaultConfig = {
@@ -38,27 +25,32 @@ async function loadAgentConfig(agentId: string) {
   };
 
   try {
-    const response = await fetch(
-      `${SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=*`,
-      {
-        headers: {
-          'apikey': SUPABASE_KEY!,
-          'Authorization': `Bearer ${SUPABASE_KEY}`,
-        },
-      }
-    );
+    const url = `${SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=*`;
+    console.log(`[AGENT_FETCH] URL: ${url}`);
     
-    const agents = await response.json();
+    const response = await fetch(url, {
+      headers: {
+        'apikey': SUPABASE_KEY!,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+      },
+    });
+    
+    const raw = await response.text();
+    console.log(`[AGENT_FETCH] Status: ${response.status}`);
+    console.log(`[AGENT_FETCH] Response: ${raw.substring(0, 500)}`);
+    
+    const agents = JSON.parse(raw);
     const agent = agents[0];
     
     if (!agent) {
-      console.log(`No agent found with ID ${agentId}, using defaults`);
+      console.log(`[AGENT] No agent found with ID ${agentId}, using defaults`);
       return defaultConfig;
     }
 
     console.log(`✅ Loaded agent: ${agent.name} (${agent.id})`);
     console.log(`   Voice Provider: ${agent.voice_provider}, Voice: ${agent.voice}`);
-    console.log(`   Greeting: ${agent.greeting?.substring(0, 50)}...`);
+    console.log(`   ElevenLabs Voice ID: ${agent.elevenlabs_voice_id}`);
+    console.log(`   Greeting: ${agent.greeting?.substring(0, 80)}...`);
 
     return {
       systemPrompt: agent.system_prompt || defaultConfig.systemPrompt,
@@ -70,36 +62,8 @@ async function loadAgentConfig(agentId: string) {
       greeting: agent.greeting || null,
     };
   } catch (e) {
-    console.error("Error fetching agent config:", e);
+    console.error("[AGENT] Error fetching agent config:", e);
     return defaultConfig;
-  }
-}
-
-async function saveMetrics(data: {
-  agentId: string | null;
-  callSid: string | null;
-  streamSid: string | null;
-  metrics: Record<string, number | null>;
-  useElevenLabs: boolean;
-  voiceId: string;
-}) {
-  try {
-    await supabaseQuery('call_metrics', 'POST', {
-      agent_id: data.agentId,
-      call_sid: data.callSid,
-      stream_sid: data.streamSid,
-      openai_connection_ms: data.metrics.openaiConnectionMs,
-      session_setup_ms: data.metrics.sessionSetupMs,
-      text_generation_ms: data.metrics.textGenerationMs,
-      elevenlabs_api_ms: data.metrics.elevenlabsApiMs,
-      first_audio_chunk_ms: data.metrics.firstAudioChunkMs,
-      total_response_ms: data.metrics.totalResponseMs,
-      use_elevenlabs: data.useElevenLabs,
-      voice_id: data.voiceId,
-    });
-    console.log("[METRICS] Saved to database");
-  } catch (e) {
-    console.error("[METRICS] Error saving:", e);
   }
 }
 
@@ -122,22 +86,10 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   let useElevenLabs = false;
   let audioBuffer: string[] = [];
   let twilioPlaybackToken = 0;
-
-  // Metrics tracking
   let callStartTime: number | null = null;
   let responseStartTime: number | null = null;
-  let metricsData: Record<string, number | null> = {};
-
-  // Heartbeat for connection monitoring
-  let lastActivityTime = Date.now();
-  const heartbeatInterval = setInterval(() => {
-    const inactiveTime = Date.now() - lastActivityTime;
-    const callDuration = callStartTime ? ((Date.now() - callStartTime) / 1000).toFixed(0) : '0';
-    console.log(`[HEARTBEAT] Call: ${callSid}, Duration: ${callDuration}s, Inactive: ${(inactiveTime/1000).toFixed(0)}s, Twilio: ${socket.readyState}, OpenAI: ${openAIWs?.readyState ?? 'null'}`);
-  }, 30000);
 
   const cleanup = () => {
-    clearInterval(heartbeatInterval);
     if (openAIWs) {
       openAIWs.close();
       openAIWs = null;
@@ -180,8 +132,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
         return;
       }
 
-      metricsData.elevenlabsApiMs = Math.round(performance.now() - startTime);
-      console.log(`[ELEVENLABS] API response in ${metricsData.elevenlabsApiMs}ms`);
+      console.log(`[ELEVENLABS] API response in ${Math.round(performance.now() - startTime)}ms`);
 
       const reader = response.body.getReader();
       let buffer = new Uint8Array(0);
@@ -213,10 +164,6 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           buffer = buffer.slice(CHUNK_SIZE);
 
           if (streamSid && socket.readyState === WebSocket.OPEN) {
-            if (chunksSent === 0) {
-              metricsData.firstAudioChunkMs = Math.round(performance.now() - startTime);
-              console.log(`[ELEVENLABS] First audio chunk in ${metricsData.firstAudioChunkMs}ms`);
-            }
             const base64Chunk = base64Encode(chunk);
             socket.send(JSON.stringify({
               event: 'media',
@@ -228,7 +175,6 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
         }
       }
 
-      // Send remaining buffer
       if (buffer.length > 0 && currentToken === twilioPlaybackToken && streamSid && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({
           event: 'media',
@@ -247,7 +193,6 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   socket.onmessage = async (event) => {
     try {
       const data = JSON.parse(event.data);
-      lastActivityTime = Date.now();
 
       switch (data.event) {
         case 'connected':
@@ -279,8 +224,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           ]);
 
           openAIWs.onopen = () => {
-            metricsData.openaiConnectionMs = Math.round(performance.now() - callStartTime!);
-            console.log(`[OPENAI] Connected in ${metricsData.openaiConnectionMs}ms`);
+            console.log(`[OPENAI] Connected in ${Math.round(performance.now() - callStartTime!)}ms`);
 
             const modalitiesConfig = useElevenLabs ? ["text"] : ["text", "audio"];
             const sessionConfig = {
@@ -311,8 +255,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
               if (response.type === 'session.created') {
                 console.log("[OPENAI] Session created");
               } else if (response.type === 'session.updated') {
-                metricsData.sessionSetupMs = Math.round(performance.now() - callStartTime!);
-                console.log(`[OPENAI] Session updated in ${metricsData.sessionSetupMs}ms`);
+                console.log(`[OPENAI] Session updated`);
 
                 // Send initial greeting using agent's configured greeting
                 responseStartTime = performance.now();
@@ -320,7 +263,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                   ? `Di exactamente este saludo, no agregues nada más: "${agentConfig.greeting}"`
                   : "Saluda al usuario de forma breve y amigable. Preséntate con tu nombre y pregunta en qué puedes ayudar.";
                 
-                console.log(`[GREETING] Using: ${greetingInstruction.substring(0, 80)}...`);
+                console.log(`[GREETING] Instruction: ${greetingInstruction.substring(0, 100)}...`);
                 
                 openAIWs?.send(JSON.stringify({
                   type: "response.create",
@@ -341,26 +284,14 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                 audioBuffer.push(response.delta);
               } else if (response.type === 'response.text.done' || response.type === 'response.done') {
                 if (useElevenLabs && audioBuffer.length > 0) {
-                  metricsData.textGenerationMs = responseStartTime ? Math.round(performance.now() - responseStartTime) : null;
                   const fullText = audioBuffer.join('');
                   audioBuffer = [];
-                  console.log(`[OPENAI] Text generated in ${metricsData.textGenerationMs}ms: "${fullText.substring(0, 50)}..."`);
+                  console.log(`[OPENAI] Text: "${fullText.substring(0, 100)}..."`);
                   streamElevenLabsSpeech(fullText).catch(console.error);
                 }
 
                 if (response.type === 'response.done') {
-                  metricsData.totalResponseMs = responseStartTime ? Math.round(performance.now() - responseStartTime) : null;
-                  console.log(`[METRICS] Total response: ${metricsData.totalResponseMs}ms`);
-
-                  saveMetrics({
-                    agentId: currentAgentId,
-                    callSid,
-                    streamSid,
-                    metrics: metricsData,
-                    useElevenLabs,
-                    voiceId: useElevenLabs ? (getElevenLabsVoiceId() || '') : agentConfig.voice,
-                  });
-
+                  console.log(`[METRICS] Response done`);
                   responseStartTime = null;
                 }
               } else if (response.type === 'input_audio_buffer.speech_started') {
@@ -386,8 +317,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           };
 
           openAIWs.onclose = (event) => {
-            const duration = callStartTime ? ((Date.now() - callStartTime) / 1000).toFixed(0) : 'unknown';
-            console.log(`[OPENAI] WebSocket closed - Code: ${event.code}, Reason: "${event.reason || 'none'}", Duration: ${duration}s`);
+            console.log(`[OPENAI] WebSocket closed - Code: ${event.code}`);
           };
           break;
 
@@ -401,8 +331,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           break;
 
         case 'stop':
-          const duration = callStartTime ? ((Date.now() - callStartTime) / 1000).toFixed(0) : 'unknown';
-          console.log(`[TWILIO] Stream stopped after ${duration}s`);
+          console.log(`[TWILIO] Stream stopped`);
           cleanup();
           break;
       }
@@ -415,38 +344,32 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
     console.error("[TWILIO] WebSocket error:", error);
   };
 
-  socket.onclose = (event) => {
-    const duration = callStartTime ? ((Date.now() - callStartTime) / 1000).toFixed(0) : 'unknown';
-    console.log(`[TWILIO] WebSocket closed - Code: ${event.code}, Duration: ${duration}s`);
+  socket.onclose = () => {
+    console.log(`[TWILIO] WebSocket closed`);
     cleanup();
   };
 }
 
-// HTTP Server using modern Deno.serve API
 Deno.serve({ port: PORT }, async (req) => {
   const url = new URL(req.url);
   const upgradeHeader = req.headers.get("upgrade") || "";
 
-  console.log(`[REQUEST] ${req.method} ${url.pathname} - Upgrade: ${upgradeHeader}`);
+  console.log(`[REQUEST] ${req.method} ${url.pathname}`);
 
-  // Health check endpoint
   if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }), {
+    return new Response(JSON.stringify({ status: "ok" }), {
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  // WebSocket upgrade for relay
   if (upgradeHeader.toLowerCase() === "websocket") {
     const urlAgentId = url.searchParams.get('agentId');
-    console.log(`[WEBSOCKET] Upgrading connection for agent: ${urlAgentId}`);
-    
     const { socket, response } = Deno.upgradeWebSocket(req);
     handleWebSocket(socket, urlAgentId);
     return response;
   }
 
-  return new Response("Realtime Relay Server - Use WebSocket connection", { status: 200 });
+  return new Response("Realtime Relay Server", { status: 200 });
 });
 
 console.log(`✅ Realtime Relay Server running on port ${PORT}`);
