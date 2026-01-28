@@ -1,6 +1,9 @@
 /**
  * Railway Relay Server for Multi-Provider Voice Support
  * 
+ * VERSION: 3.1.0
+ * BUILD DATE: 2025-01-28
+ * 
  * This server acts as a bridge between:
  * - Twilio/Telnyx/Other providers (incoming phone calls via WebSocket)
  * - OpenAI Realtime API (speech-to-text and reasoning)
@@ -20,8 +23,11 @@
  * 5. On call end: Report duration and transcript to backend
  */
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+const VERSION = "3.1.0";
+const BUILD_DATE = "2025-01-28";
+
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
+import { WebSocket as NodeWebSocket } from "npm:ws@8.18.0";
 
 // Environment variables
 // NOTE: avoid non-null assertions for optional integrations to prevent relay crashes.
@@ -46,6 +52,27 @@ if (!RELAY_SHARED_SECRET) {
 
 // OpenAI Realtime API configuration
 const OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
+
+// Connect to OpenAI Realtime using npm:ws (supports custom headers)
+function connectOpenAIRealtime(): Promise<NodeWebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new NodeWebSocket(OPENAI_REALTIME_URL, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    });
+
+    ws.once("open", () => {
+      console.log("[OpenAI] WebSocket connected via npm:ws");
+      resolve(ws);
+    });
+
+    ws.once("error", (err: Error) => {
+      reject(err);
+    });
+  });
+}
 
 // Supported providers
 type Provider = "twilio" | "telnyx" | "unknown";
@@ -307,13 +334,14 @@ async function handleProviderConnection(
   let callLogId = initialCallLogId;
   let provider = initialProvider;
   let agentConfig: AgentConfig | null = null;
-  let openAISocket: WebSocket | null = null;
+  let openAISocket: NodeWebSocket | null = null;
   let streamId = "";
   let audioBuffer: string[] = [];
 
   // Call tracking
   let callStartTime: number | null = null;
   const transcriptMessages: TranscriptMessage[] = [];
+  let audioFrameCount = 0; // Debug: count audio frames sent
 
   // Determine if using ElevenLabs (will be set after agent loads)
   let useElevenLabs = false;
@@ -358,51 +386,54 @@ async function handleProviderConnection(
       return;
     }
 
-    openAISocket = new WebSocket(OPENAI_REALTIME_URL, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    });
+    try {
+      openAISocket = await connectOpenAIRealtime();
+    } catch (err) {
+      console.error("[OpenAI] Failed to connect:", err);
+      return;
+    }
 
-    // Handle OpenAI connection
-    openAISocket.onopen = () => {
-      console.log("[OpenAI] Connected");
-
-      // Configure session based on voice provider
-      const sessionConfig = {
-        type: "session.update",
-        session: {
-          modalities: useElevenLabs ? ["text"] : ["text", "audio"],
-          instructions: agentConfig!.system_prompt || "You are a helpful assistant.",
-          voice: useElevenLabs ? "alloy" : agentConfig!.voice,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: {
-            model: "whisper-1",
-          },
-          turn_detection: {
-            type: "server_vad",
-            threshold: agentConfig!.vad_threshold ?? 0.6,
-            prefix_padding_ms: agentConfig!.prefix_padding_ms ?? 400,
-            silence_duration_ms: agentConfig!.silence_duration_ms ?? 800,
-          },
-          temperature: agentConfig!.temperature ?? 0.8,
+    // Configure session immediately since we connected via promise
+    const sessionConfig = {
+      type: "session.update",
+      session: {
+        modalities: useElevenLabs ? ["text"] : ["text", "audio"],
+        instructions: agentConfig!.system_prompt || "You are a helpful assistant.",
+        voice: useElevenLabs ? "alloy" : agentConfig!.voice,
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        input_audio_transcription: {
+          model: "whisper-1",
         },
-      };
-
-      openAISocket!.send(JSON.stringify(sessionConfig));
-      console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
-
-      // Send greeting immediately after session is configured
-      if (agentConfig!.greeting && streamId) {
-        sendGreeting();
-      }
+        turn_detection: {
+          type: "server_vad",
+          threshold: agentConfig!.vad_threshold ?? 0.6,
+          prefix_padding_ms: agentConfig!.prefix_padding_ms ?? 400,
+          silence_duration_ms: agentConfig!.silence_duration_ms ?? 800,
+        },
+        temperature: agentConfig!.temperature ?? 0.8,
+      },
     };
 
-    // Handle OpenAI messages
-    openAISocket.onmessage = async (event) => {
-      const data = JSON.parse(event.data as string);
+    openAISocket.send(JSON.stringify(sessionConfig));
+    console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
+
+    // Handle OpenAI messages using Node.js EventEmitter pattern
+    openAISocket.on("message", async (rawData: Buffer | string, isBinary: boolean) => {
+      // Skip binary frames - OpenAI realtime sends JSON text frames only
+      if (isBinary) {
+        console.warn("[OpenAI] Received unexpected binary frame, skipping");
+        return;
+      }
+      
+      let data;
+      try {
+        const textData = typeof rawData === "string" ? rawData : rawData.toString("utf-8");
+        data = JSON.parse(textData);
+      } catch (parseError) {
+        console.error("[OpenAI] Failed to parse message:", parseError, "Raw:", String(rawData).substring(0, 100));
+        return;
+      }
 
       switch (data.type) {
         case "session.created":
@@ -494,15 +525,15 @@ async function handleProviderConnection(
             console.log(`[OpenAI] ${data.type}:`, data.transcript || data);
           }
       }
-    };
+    });
 
-    openAISocket.onerror = (error) => {
+    openAISocket.on("error", (error: Error) => {
       console.error("[OpenAI] WebSocket error:", error);
-    };
+    });
 
-    openAISocket.onclose = () => {
+    openAISocket.on("close", () => {
       console.log("[OpenAI] Connection closed");
-    };
+    });
   };
 
   // Function to send greeting
@@ -527,7 +558,7 @@ async function handleProviderConnection(
         streamId,
         provider
       );
-    } else if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
+    } else if (openAISocket && openAISocket.readyState === NodeWebSocket.OPEN) {
       const greetingEvent = {
         type: "response.create",
         response: {
@@ -593,11 +624,30 @@ async function handleProviderConnection(
       case "media":
         // Forward audio to OpenAI - payload location may differ
         const audioPayload = rawData.media?.payload || msg.audioPayload;
-        if (openAISocket && openAISocket.readyState === WebSocket.OPEN && audioPayload) {
+        if (openAISocket && openAISocket.readyState === NodeWebSocket.OPEN && audioPayload) {
+          // Validate that audioPayload is a valid base64 string (no special chars that break JSON)
+          if (typeof audioPayload !== "string") {
+            console.warn("[Relay] Invalid audio payload type:", typeof audioPayload);
+            break;
+          }
+          
+          audioFrameCount++;
+          
+          // Log first audio frame for debugging
+          if (audioFrameCount === 1) {
+            console.log(`[Relay] First audio frame - length: ${audioPayload.length}, preview: ${audioPayload.substring(0, 50)}...`);
+          }
+          
+          // Log every 100th frame to track progress without flooding logs
+          if (audioFrameCount % 100 === 0) {
+            console.log(`[Relay] Audio frames sent: ${audioFrameCount}`);
+          }
+          
           const audioEvent = {
             type: "input_audio_buffer.append",
             audio: audioPayload,
           };
+          
           openAISocket.send(JSON.stringify(audioEvent));
         }
         break;
@@ -652,7 +702,8 @@ async function handleRequest(request: Request): Promise<Response> {
       JSON.stringify({
         status: "ok",
         service: "realtime-relay",
-        version: "3.0.0",
+        version: VERSION,
+        build_date: BUILD_DATE,
         features: ["multi-provider", "transcription", "duration-tracking", "call-logging"],
         providers: ["twilio", "telnyx"],
         timestamp: new Date().toISOString(),
@@ -668,5 +719,6 @@ async function handleRequest(request: Request): Promise<Response> {
 
 // Start server
 console.log(`[Relay] Starting server on port ${PORT}...`);
+console.log(`[Relay] Version: ${VERSION} (Build: ${BUILD_DATE})`);
 console.log(`[Relay] Features: multi-provider support (Twilio, Telnyx), transcription, duration tracking, call logging`);
 Deno.serve({ port: PORT }, handleRequest);
