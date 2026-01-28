@@ -19,6 +19,8 @@ async function loadAgentConfig(agentId: string) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente Virtual",
     greeting: null as string | null,
+    whisperLanguage: "es",
+    whisperPrompt: null as string | null,
   };
 
   try {
@@ -55,6 +57,8 @@ async function loadAgentConfig(agentId: string) {
       elevenlabsModel: data.elevenlabsModel || "eleven_turbo_v2_5",
       name: data.name || defaultConfig.name,
       greeting: data.greeting || null,
+      whisperLanguage: data.whisperLanguage || "es",
+      whisperPrompt: data.whisperPrompt || null,
     };
   } catch (e) {
     console.error("[AGENT] Error fetching agent config:", e);
@@ -82,6 +86,8 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente",
     greeting: null as string | null,
+    whisperLanguage: "es",
+    whisperPrompt: null as string | null,
   };
   let useElevenLabs = false;
   let audioBuffer: string[] = [];
@@ -304,6 +310,18 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           openAIWs.onopen = () => {
             console.log(`[OPENAI] Connected`);
 
+            // Build transcription config with optional prompt
+            const transcriptionConfig: Record<string, unknown> = { 
+              model: "whisper-1",
+            };
+            if (agentConfig.whisperLanguage && agentConfig.whisperLanguage !== 'auto') {
+              transcriptionConfig.language = agentConfig.whisperLanguage;
+            }
+            if (agentConfig.whisperPrompt) {
+              transcriptionConfig.prompt = agentConfig.whisperPrompt;
+              console.log(`[WHISPER] Using prompt: "${agentConfig.whisperPrompt.substring(0, 50)}..."`);
+            }
+
             const sessionConfig = {
               type: "session.update",
               session: {
@@ -312,7 +330,7 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
                 voice: useElevenLabs ? "alloy" : agentConfig.voice,
                 input_audio_format: "g711_ulaw",
                 output_audio_format: "g711_ulaw",
-                input_audio_transcription: { model: "whisper-1" },
+                input_audio_transcription: transcriptionConfig,
                 turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 800 },
               },
             };
