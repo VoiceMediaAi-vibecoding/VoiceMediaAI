@@ -1,331 +1,612 @@
-import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/base64.ts";
+/**
+ * Railway Relay Server for Multi-Provider Voice Support
+ * 
+ * This server acts as a bridge between:
+ * - Twilio/Telnyx/Other providers (incoming phone calls via WebSocket)
+ * - OpenAI Realtime API (speech-to-text and reasoning)
+ * - ElevenLabs (high-quality text-to-speech)
+ * 
+ * Features:
+ * - Multi-provider support (auto-detects Twilio, Telnyx, etc.)
+ * - Real-time transcription capture (user + agent)
+ * - Call duration tracking
+ * - Automatic call log updates via backend API
+ * 
+ * Flow:
+ * 1. Provider sends audio stream via WebSocket
+ * 2. Audio is forwarded to OpenAI for STT and processing
+ * 3. If using ElevenLabs: OpenAI returns text -> ElevenLabs TTS -> audio to provider
+ * 4. If using OpenAI voices: OpenAI returns audio directly -> provider
+ * 5. On call end: Report duration and transcript to backend
+ */
 
-// Load environment variables
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
-const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY");
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 
+// Environment variables
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
+const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
+const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET")!;
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Realtime Relay Server starting on port ${PORT}...`);
+// OpenAI Realtime API configuration
+const OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
 
-async function loadAgentConfig(agentId: string) {
-  const defaultConfig = {
-    systemPrompt: "You are a helpful AI assistant for phone calls. Respond in Spanish. Be concise and helpful.",
-    voice: "alloy",
-    voiceProvider: "openai",
-    elevenlabsVoiceId: null as string | null,
-    elevenlabsModel: "eleven_turbo_v2_5",
-    name: "Asistente Virtual",
-    greeting: null as string | null,
-  };
+// Supported providers
+type Provider = "twilio" | "telnyx" | "unknown";
+
+// Agent configuration interface
+interface AgentConfig {
+  id: string;
+  name: string;
+  voice: string;
+  voice_provider: "openai" | "elevenlabs" | "custom";
+  elevenlabs_voice_id: string | null;
+  elevenlabs_model: string | null;
+  system_prompt: string | null;
+  greeting: string | null;
+  temperature: number | null;
+  vad_threshold: number | null;
+  silence_duration_ms: number | null;
+  prefix_padding_ms: number | null;
+}
+
+// Transcript message interface
+interface TranscriptMessage {
+  role: "user" | "agent";
+  content: string;
+  timestamp: number;
+}
+
+// Provider-specific message formats
+interface ProviderMessage {
+  provider: Provider;
+  event: string;
+  streamId: string;
+  audioPayload?: string;
+  customParams?: Record<string, string>;
+}
+
+// Load agent configuration from Supabase
+async function loadAgentConfig(agentId: string): Promise<AgentConfig | null> {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  const { data, error } = await supabase
+    .from("agents")
+    .select("*")
+    .eq("id", agentId)
+    .single();
+
+  if (error || !data) {
+    console.error("Error loading agent:", error);
+    return null;
+  }
+
+  return data as AgentConfig;
+}
+
+// Update call log via backend function
+async function updateCallLog(
+  callLogId: string,
+  durationSeconds: number,
+  transcript: TranscriptMessage[],
+  status: string
+): Promise<void> {
+  if (!callLogId) {
+    console.warn("[Relay] No call_log_id provided, skipping update");
+    return;
+  }
 
   try {
-    // Call Lovable Cloud edge function to get agent config
-    const url = `${SUPABASE_URL}/functions/v1/relay-agent-config`;
-    console.log(`[AGENT_FETCH] Calling: ${url}`);
-    
-    const response = await fetch(url, {
-      method: 'POST',
+    // Format transcript as readable text
+    const formattedTranscript = transcript
+      .map(msg => `[${msg.role.toUpperCase()}]: ${msg.content}`)
+      .join("\n");
+
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/update-call-log`, {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        'x-relay-secret': RELAY_SHARED_SECRET!,
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${RELAY_SHARED_SECRET}`,
       },
-      body: JSON.stringify({ agentId }),
+      body: JSON.stringify({
+        call_log_id: callLogId,
+        duration_seconds: durationSeconds,
+        transcript: formattedTranscript,
+        status: status,
+        ended_at: new Date().toISOString(),
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error("[Relay] Failed to update call log:", error);
+    } else {
+      const result = await response.json();
+      console.log("[Relay] Call log updated:", result);
+    }
+  } catch (error) {
+    console.error("[Relay] Error updating call log:", error);
+  }
+}
+
+// Stream ElevenLabs TTS audio to provider
+async function streamElevenLabsSpeech(
+  text: string,
+  voiceId: string,
+  model: string,
+  providerSocket: WebSocket,
+  streamId: string,
+  provider: Provider
+): Promise<void> {
+  console.log(`[ElevenLabs] Generating speech for: "${text.substring(0, 50)}..."`);
+  
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: model,
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    console.error("[ElevenLabs] TTS request failed:", await response.text());
+    return;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) return;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      // Format media message based on provider
+      const mediaMessage = formatMediaMessage(provider, streamId, base64Encode(value));
+
+      if (providerSocket.readyState === WebSocket.OPEN) {
+        providerSocket.send(mediaMessage);
+      }
+    }
+  } catch (error) {
+    console.error("[ElevenLabs] Stream error:", error);
+  }
+}
+
+// Format media message for specific provider
+function formatMediaMessage(provider: Provider, streamId: string, payload: string): string {
+  if (provider === "telnyx") {
+    // Telnyx format
+    return JSON.stringify({
+      event: "media",
+      stream_id: streamId,
+      media: {
+        payload: payload,
+      },
+    });
+  }
+  // Default: Twilio format
+  return JSON.stringify({
+    event: "media",
+    streamSid: streamId,
+    media: {
+      payload: payload,
+    },
+  });
+}
+
+// Parse incoming message and detect provider
+function parseProviderMessage(data: unknown): ProviderMessage {
+  const parsed = data as Record<string, unknown>;
+  
+  // Telnyx format detection
+  if (parsed.stream_id || parsed.call_control_id) {
+    const event = parsed.event as string || "unknown";
+    const streamId = parsed.stream_id as string || "";
+    const media = parsed.media as Record<string, string> | undefined;
+    
+    // Get custom params from start event
+    const startData = parsed.start as Record<string, unknown> | undefined;
+    const customParams = startData?.customParameters as Record<string, string> || {};
+    
+    return {
+      provider: "telnyx",
+      event: event,
+      streamId: streamId,
+      audioPayload: media?.payload,
+      customParams,
+    };
+  }
+  
+  // Twilio format (default)
+  const event = parsed.event as string || "unknown";
+  const startData = parsed.start as Record<string, unknown> | undefined;
+  const streamSid = startData?.streamSid as string || "";
+  const media = parsed.media as Record<string, string> | undefined;
+  const customParams = startData?.customParameters as Record<string, string> || {};
+  
+  return {
+    provider: "twilio",
+    event: event,
+    streamId: streamSid,
+    audioPayload: media?.payload,
+    customParams,
+  };
+}
+
+// Handle WebSocket connection from any provider
+async function handleProviderConnection(
+  providerSocket: WebSocket,
+  initialAgentId: string | null,
+  initialCallLogId: string | null,
+  initialProvider: Provider
+): Promise<void> {
+  console.log(`[Relay] New connection, agentId: ${initialAgentId}, callLogId: ${initialCallLogId}, provider: ${initialProvider}`);
+
+  let agentId = initialAgentId;
+  let callLogId = initialCallLogId;
+  let provider = initialProvider;
+  let agentConfig: AgentConfig | null = null;
+  let openAISocket: WebSocket | null = null;
+  let streamId = "";
+  let audioBuffer: string[] = [];
+
+  // Call tracking
+  let callStartTime: number | null = null;
+  const transcriptMessages: TranscriptMessage[] = [];
+
+  // Determine if using ElevenLabs (will be set after agent loads)
+  let useElevenLabs = false;
+  let elevenLabsVoiceId = "JBFqnCBsd6RMkjVDRZzb";
+  let elevenLabsModel = "eleven_turbo_v2_5";
+
+  // Function to finalize call and update backend
+  const finalizeCall = async (status: string = "completed") => {
+    if (!callStartTime) {
+      console.warn("[Relay] Call never started, skipping finalization");
+      return;
+    }
+
+    const durationSeconds = Math.round((Date.now() - callStartTime) / 1000);
+    console.log(`[Relay] Finalizing call - Duration: ${durationSeconds}s, Messages: ${transcriptMessages.length}`);
+
+    await updateCallLog(callLogId || "", durationSeconds, transcriptMessages, status);
+  };
+
+  // Function to initialize OpenAI connection after agent is loaded
+  const initializeOpenAI = async () => {
+    if (!agentConfig) return;
+
+    useElevenLabs = agentConfig.voice_provider === "elevenlabs" || agentConfig.voice_provider === "custom";
+    elevenLabsVoiceId = agentConfig.elevenlabs_voice_id || "JBFqnCBsd6RMkjVDRZzb";
+    elevenLabsModel = agentConfig.elevenlabs_model || "eleven_turbo_v2_5";
+
+    console.log(`[Relay] Agent loaded: ${agentConfig.name}, provider: ${agentConfig.voice_provider}`);
+
+    // Connect to OpenAI Realtime API
+    openAISocket = new WebSocket(OPENAI_REALTIME_URL, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    });
+
+    // Handle OpenAI connection
+    openAISocket.onopen = () => {
+      console.log("[OpenAI] Connected");
+
+      // Configure session based on voice provider
+      const sessionConfig = {
+        type: "session.update",
+        session: {
+          modalities: useElevenLabs ? ["text"] : ["text", "audio"],
+          instructions: agentConfig!.system_prompt || "You are a helpful assistant.",
+          voice: useElevenLabs ? "alloy" : agentConfig!.voice,
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          input_audio_transcription: {
+            model: "whisper-1",
+          },
+          turn_detection: {
+            type: "server_vad",
+            threshold: agentConfig!.vad_threshold ?? 0.6,
+            prefix_padding_ms: agentConfig!.prefix_padding_ms ?? 400,
+            silence_duration_ms: agentConfig!.silence_duration_ms ?? 800,
+          },
+          temperature: agentConfig!.temperature ?? 0.8,
+        },
+      };
+
+      openAISocket!.send(JSON.stringify(sessionConfig));
+      console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
+
+      // Send greeting immediately after session is configured
+      if (agentConfig!.greeting && streamId) {
+        sendGreeting();
+      }
+    };
+
+    // Handle OpenAI messages
+    openAISocket.onmessage = async (event) => {
+      const data = JSON.parse(event.data as string);
+
+      switch (data.type) {
+        case "session.created":
+          console.log("[OpenAI] Session created");
+          break;
+
+        case "session.updated":
+          console.log("[OpenAI] Session updated");
+          // Send greeting after session is properly configured
+          if (agentConfig!.greeting && streamId) {
+            sendGreeting();
+          }
+          break;
+
+        // Capture user transcription
+        case "conversation.item.input_audio_transcription.completed":
+          if (data.transcript) {
+            console.log("[Transcript] User:", data.transcript);
+            transcriptMessages.push({
+              role: "user",
+              content: data.transcript,
+              timestamp: Date.now(),
+            });
+          }
+          break;
+
+        // Capture agent transcription (for audio responses)
+        case "response.audio_transcript.done":
+          if (data.transcript) {
+            console.log("[Transcript] Agent:", data.transcript);
+            transcriptMessages.push({
+              role: "agent",
+              content: data.transcript,
+              timestamp: Date.now(),
+            });
+          }
+          break;
+
+        case "response.text.delta":
+          // Accumulate text for ElevenLabs
+          if (useElevenLabs && data.delta) {
+            audioBuffer.push(data.delta);
+          }
+          break;
+
+        case "response.text.done":
+          // Capture agent text response and convert to speech via ElevenLabs
+          if (useElevenLabs && audioBuffer.length > 0) {
+            const fullText = audioBuffer.join("");
+            audioBuffer = [];
+
+            // Add to transcript
+            console.log("[Transcript] Agent:", fullText);
+            transcriptMessages.push({
+              role: "agent",
+              content: fullText,
+              timestamp: Date.now(),
+            });
+
+            await streamElevenLabsSpeech(
+              fullText,
+              elevenLabsVoiceId,
+              elevenLabsModel,
+              providerSocket,
+              streamId,
+              provider
+            );
+          }
+          break;
+
+        case "response.audio.delta":
+          // Send OpenAI audio directly to provider (when not using ElevenLabs)
+          if (!useElevenLabs && data.delta && streamId) {
+            const mediaMessage = formatMediaMessage(provider, streamId, data.delta);
+
+            if (providerSocket.readyState === WebSocket.OPEN) {
+              providerSocket.send(mediaMessage);
+            }
+          }
+          break;
+
+        case "error":
+          console.error("[OpenAI] Error:", data.error);
+          break;
+
+        default:
+          // Log transcript events for debugging
+          if (data.type.includes("transcript")) {
+            console.log(`[OpenAI] ${data.type}:`, data.transcript || data);
+          }
+      }
+    };
+
+    openAISocket.onerror = (error) => {
+      console.error("[OpenAI] WebSocket error:", error);
+    };
+
+    openAISocket.onclose = () => {
+      console.log("[OpenAI] Connection closed");
+    };
+  };
+
+  // Function to send greeting
+  const sendGreeting = async () => {
+    if (!agentConfig?.greeting || !streamId) return;
+    
+    console.log("[Relay] Sending greeting...");
+
+    // Add greeting to transcript
+    transcriptMessages.push({
+      role: "agent",
+      content: agentConfig.greeting,
+      timestamp: Date.now(),
     });
     
-    const data = await response.json();
-    console.log(`[AGENT_FETCH] Status: ${response.status}`);
-    
-    if (!response.ok) {
-      console.error(`[AGENT_FETCH] Error:`, data);
-      return defaultConfig;
-    }
-
-    console.log(`✅ Loaded agent: ${data.name} (${data.id})`);
-    console.log(`   Voice Provider: ${data.voiceProvider}, Voice: ${data.voice}`);
-    console.log(`   ElevenLabs Voice ID: ${data.elevenlabsVoiceId}`);
-    console.log(`   Greeting: ${data.greeting?.substring(0, 80)}...`);
-
-    return {
-      systemPrompt: data.systemPrompt || defaultConfig.systemPrompt,
-      voice: data.voice || "alloy",
-      voiceProvider: data.voiceProvider || "openai",
-      elevenlabsVoiceId: data.elevenlabsVoiceId,
-      elevenlabsModel: data.elevenlabsModel || "eleven_turbo_v2_5",
-      name: data.name || defaultConfig.name,
-      greeting: data.greeting || null,
-    };
-  } catch (e) {
-    console.error("[AGENT] Error fetching agent config:", e);
-    return defaultConfig;
-  }
-}
-
-function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
-  console.log(`[CONNECTION] New WebSocket connection (urlAgentId: ${urlAgentId ?? 'none'})`);
-
-  let openAIWs: WebSocket | null = null;
-  let streamSid: string | null = null;
-  let callSid: string | null = null;
-  let agentConfig = {
-    systemPrompt: "",
-    voice: "alloy",
-    voiceProvider: "openai",
-    elevenlabsVoiceId: null as string | null,
-    elevenlabsModel: "eleven_turbo_v2_5",
-    name: "Asistente",
-    greeting: null as string | null,
-  };
-  let useElevenLabs = false;
-  let audioBuffer: string[] = [];
-  let twilioPlaybackToken = 0;
-  let callStartTime: number | null = null;
-
-  const cleanup = () => {
-    if (openAIWs) {
-      openAIWs.close();
-      openAIWs = null;
-    }
-  };
-
-  const getElevenLabsVoiceId = () => {
-    return agentConfig.elevenlabsVoiceId || "EXAVITQu4vr4xnSDxMaL";
-  };
-
-  async function streamElevenLabsSpeech(text: string): Promise<void> {
-    const currentToken = ++twilioPlaybackToken;
-
-    try {
-      const voiceId = getElevenLabsVoiceId();
-      console.log(`[ELEVENLABS] Starting TTS for voice: ${voiceId}`);
-
-      const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
-        {
-          method: "POST",
-          headers: {
-            "xi-api-key": ELEVENLABS_API_KEY!,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text,
-            model_id: agentConfig.elevenlabsModel,
-            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-          }),
-        }
+    if (useElevenLabs) {
+      await streamElevenLabsSpeech(
+        agentConfig.greeting,
+        elevenLabsVoiceId,
+        elevenLabsModel,
+        providerSocket,
+        streamId,
+        provider
       );
-
-      if (!response.ok || !response.body) {
-        console.error(`[ELEVENLABS] API error: ${response.status}`);
-        return;
-      }
-
-      const reader = response.body.getReader();
-      let buffer = new Uint8Array(0);
-      const CHUNK_SIZE = 160;
-
-      while (true) {
-        if (currentToken !== twilioPlaybackToken) {
-          reader.cancel();
-          return;
-        }
-
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const newBuffer = new Uint8Array(buffer.length + value.length);
-        newBuffer.set(buffer);
-        newBuffer.set(value, buffer.length);
-        buffer = newBuffer;
-
-        while (buffer.length >= CHUNK_SIZE) {
-          if (currentToken !== twilioPlaybackToken) {
-            reader.cancel();
-            return;
-          }
-
-          const chunk = buffer.slice(0, CHUNK_SIZE);
-          buffer = buffer.slice(CHUNK_SIZE);
-
-          if (streamSid && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload: base64Encode(chunk) },
-            }));
-          }
-        }
-      }
-
-      if (buffer.length > 0 && currentToken === twilioPlaybackToken && streamSid && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: base64Encode(buffer) },
-        }));
-      }
-
-      console.log(`[ELEVENLABS] TTS complete`);
-    } catch (error) {
-      console.error("[ELEVENLABS] Error:", error);
-    }
-  }
-
-  socket.onmessage = async (event) => {
-    try {
-      const data = JSON.parse(event.data);
-
-      switch (data.event) {
-        case 'connected':
-          console.log("[TWILIO] Stream connected");
-          break;
-
-        case 'start':
-          streamSid = data.start.streamSid;
-          callSid = data.start.callSid;
-          callStartTime = performance.now();
-          console.log(`[TWILIO] Stream started - SID: ${streamSid}, Call: ${callSid}`);
-
-          const startAgentId = data?.start?.customParameters?.agent_id || null;
-          const effectiveAgentId = (startAgentId || urlAgentId || "default").toString();
-          console.log(`[AGENT] Loading config for: ${effectiveAgentId}`);
-
-          agentConfig = await loadAgentConfig(effectiveAgentId);
-          useElevenLabs = agentConfig.voiceProvider === "elevenlabs" || agentConfig.voiceProvider === "custom";
-          console.log(`[TTS] Using ${useElevenLabs ? "ElevenLabs" : "OpenAI"}`);
-
-          const openAIUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
-          openAIWs = new WebSocket(openAIUrl, [
-            "realtime",
-            `openai-insecure-api-key.${OPENAI_API_KEY}`,
-            "openai-beta.realtime-v1"
-          ]);
-
-          openAIWs.onopen = () => {
-            console.log(`[OPENAI] Connected`);
-
-            const sessionConfig = {
-              type: "session.update",
-              session: {
-                modalities: useElevenLabs ? ["text"] : ["text", "audio"],
-                instructions: agentConfig.systemPrompt,
-                voice: useElevenLabs ? "alloy" : agentConfig.voice,
-                input_audio_format: "g711_ulaw",
-                output_audio_format: "g711_ulaw",
-                input_audio_transcription: { model: "whisper-1" },
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.6,
-                  prefix_padding_ms: 400,
-                  silence_duration_ms: 800
-                }
-              }
-            };
-            openAIWs?.send(JSON.stringify(sessionConfig));
-            console.log("[OPENAI] Session config sent");
-          };
-
-          openAIWs.onmessage = async (e) => {
-            try {
-              const response = JSON.parse(e.data);
-
-              if (response.type === 'session.created') {
-                console.log("[OPENAI] Session created");
-              } else if (response.type === 'session.updated') {
-                console.log(`[OPENAI] Session updated`);
-
-                const greetingInstruction = agentConfig.greeting 
-                  ? `Di exactamente este saludo, no agregues nada más: "${agentConfig.greeting}"`
-                  : "Saluda al usuario de forma breve y amigable.";
-                
-                console.log(`[GREETING] ${agentConfig.greeting ? 'Using agent greeting' : 'Using default'}`);
-                
-                openAIWs?.send(JSON.stringify({
-                  type: "response.create",
-                  response: {
-                    modalities: useElevenLabs ? ["text"] : ["text", "audio"],
-                    instructions: greetingInstruction
-                  }
-                }));
-              } else if (response.type === 'response.audio.delta' && !useElevenLabs) {
-                if (streamSid && socket.readyState === WebSocket.OPEN) {
-                  socket.send(JSON.stringify({
-                    event: 'media',
-                    streamSid,
-                    media: { payload: response.delta }
-                  }));
-                }
-              } else if (response.type === 'response.text.delta' && useElevenLabs) {
-                audioBuffer.push(response.delta);
-              } else if (response.type === 'response.text.done' || response.type === 'response.done') {
-                if (useElevenLabs && audioBuffer.length > 0) {
-                  const fullText = audioBuffer.join('');
-                  audioBuffer = [];
-                  console.log(`[OPENAI] Text: "${fullText.substring(0, 80)}..."`);
-                  streamElevenLabsSpeech(fullText).catch(console.error);
-                }
-              } else if (response.type === 'input_audio_buffer.speech_started') {
-                console.log("[VAD] User speaking");
-                twilioPlaybackToken++;
-                audioBuffer = [];
-                if (streamSid && socket.readyState === WebSocket.OPEN) {
-                  socket.send(JSON.stringify({ event: 'clear', streamSid }));
-                }
-              } else if (response.type === 'conversation.item.input_audio_transcription.completed') {
-                console.log(`[USER] Said: ${response.transcript}`);
-              } else if (response.type === 'error') {
-                console.error("[OPENAI] Error:", response.error);
-              }
-            } catch (e) {
-              console.error("[OPENAI] Message error:", e);
-            }
-          };
-
-          openAIWs.onerror = (error) => console.error("[OPENAI] WebSocket error:", error);
-          openAIWs.onclose = () => console.log(`[OPENAI] WebSocket closed`);
-          break;
-
-        case 'media':
-          if (openAIWs && openAIWs.readyState === WebSocket.OPEN) {
-            openAIWs.send(JSON.stringify({
-              type: 'input_audio_buffer.append',
-              audio: data.media.payload
-            }));
-          }
-          break;
-
-        case 'stop':
-          console.log(`[TWILIO] Stream stopped`);
-          cleanup();
-          break;
-      }
-    } catch (error) {
-      console.error("[TWILIO] Message error:", error);
+    } else if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
+      const greetingEvent = {
+        type: "response.create",
+        response: {
+          modalities: ["text", "audio"],
+          instructions: `Say exactly this greeting, do not add anything else: "${agentConfig.greeting}"`,
+        },
+      };
+      openAISocket.send(JSON.stringify(greetingEvent));
     }
   };
 
-  socket.onerror = (error) => console.error("[TWILIO] WebSocket error:", error);
-  socket.onclose = () => { console.log(`[TWILIO] WebSocket closed`); cleanup(); };
+  // Handle provider messages (multi-provider support)
+  providerSocket.onmessage = async (event) => {
+    const rawData = JSON.parse(event.data as string);
+    const msg = parseProviderMessage(rawData);
+    
+    // Auto-detect provider from message format if not set
+    if (provider === "unknown") {
+      provider = msg.provider;
+      console.log(`[Relay] Auto-detected provider: ${provider}`);
+    }
+
+    switch (msg.event) {
+      case "connected":
+        console.log(`[${provider}] Stream connected`);
+        break;
+
+      case "start":
+        // Handle start event - format differs by provider
+        if (provider === "telnyx") {
+          // Telnyx format
+          streamId = rawData.stream_id || rawData.start?.stream_id || "";
+          const telnyxParams = rawData.start?.customParameters || rawData.custom_parameters || {};
+          if (telnyxParams.agent_id) agentId = telnyxParams.agent_id;
+          if (telnyxParams.call_log_id) callLogId = telnyxParams.call_log_id;
+          console.log(`[Telnyx] Stream started: ${streamId}`);
+        } else {
+          // Twilio format (default)
+          streamId = rawData.start?.streamSid || "";
+          const twilioParams = rawData.start?.customParameters || {};
+          if (twilioParams.agent_id) agentId = twilioParams.agent_id;
+          if (twilioParams.call_log_id) callLogId = twilioParams.call_log_id;
+          console.log(`[Twilio] Stream started: ${streamId}`);
+        }
+        
+        callStartTime = Date.now();
+        console.log(`[Relay] Agent ID: ${agentId}, Call Log ID: ${callLogId}`);
+        
+        // Load agent config if we have an agentId
+        if (agentId) {
+          agentConfig = await loadAgentConfig(agentId);
+          if (agentConfig) {
+            console.log(`[Relay] Agent loaded: ${agentConfig.name}`);
+            await initializeOpenAI();
+          } else {
+            console.error("[Relay] Agent not found:", agentId);
+          }
+        } else {
+          console.error("[Relay] No agent_id provided");
+        }
+        break;
+
+      case "media":
+        // Forward audio to OpenAI - payload location may differ
+        const audioPayload = rawData.media?.payload || msg.audioPayload;
+        if (openAISocket && openAISocket.readyState === WebSocket.OPEN && audioPayload) {
+          const audioEvent = {
+            type: "input_audio_buffer.append",
+            audio: audioPayload,
+          };
+          openAISocket.send(JSON.stringify(audioEvent));
+        }
+        break;
+
+      case "stop":
+        console.log(`[${provider}] Stream stopped`);
+        // Finalize and report call data
+        await finalizeCall("completed");
+        if (openAISocket) openAISocket.close();
+        break;
+    }
+  };
+
+  providerSocket.onclose = async () => {
+    console.log(`[${provider}] Connection closed`);
+    // Finalize call if not already done
+    if (callStartTime && transcriptMessages.length > 0) {
+      await finalizeCall("completed");
+    }
+    if (openAISocket) openAISocket.close();
+  };
+
+  providerSocket.onerror = async (error) => {
+    console.error(`[${provider}] WebSocket error:`, error);
+    // Mark call as failed
+    await finalizeCall("failed");
+    if (openAISocket) openAISocket.close();
+  };
 }
 
-Deno.serve({ port: PORT }, async (req) => {
-  const url = new URL(req.url);
-  const upgradeHeader = req.headers.get("upgrade") || "";
+// Main HTTP server
+async function handleRequest(request: Request): Promise<Response> {
+  const url = new URL(request.url);
 
-  if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok" }), { headers: { "Content-Type": "application/json" } });
-  }
+  // Handle WebSocket upgrade for provider streams
+  if (request.headers.get("upgrade") === "websocket") {
+    // Parameters may come from URL or from provider start event
+    const agentId = url.searchParams.get("agentId");
+    const callLogId = url.searchParams.get("callLogId");
+    const providerParam = url.searchParams.get("provider") as Provider || "unknown";
+    
+    console.log(`[Relay] WebSocket upgrade, agentId: ${agentId}, callLogId: ${callLogId}, provider: ${providerParam}`);
 
-  if (upgradeHeader.toLowerCase() === "websocket") {
-    const urlAgentId = url.searchParams.get('agentId');
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    handleWebSocket(socket, urlAgentId);
+    const { socket, response } = Deno.upgradeWebSocket(request);
+    handleProviderConnection(socket, agentId, callLogId, providerParam);
     return response;
   }
 
-  return new Response("Realtime Relay Server", { status: 200 });
-});
+  // Health check endpoint
+  if (url.pathname === "/health" || url.pathname === "/") {
+    return new Response(
+      JSON.stringify({
+        status: "ok",
+        service: "realtime-relay",
+        version: "3.0.0",
+        features: ["multi-provider", "transcription", "duration-tracking", "call-logging"],
+        providers: ["twilio", "telnyx"],
+        timestamp: new Date().toISOString(),
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
 
-console.log(`✅ Realtime Relay Server running on port ${PORT}`);
+  return new Response("Not found", { status: 404 });
+}
+
+// Start server
+console.log(`[Relay] Starting server on port ${PORT}...`);
+console.log(`[Relay] Features: multi-provider support (Twilio, Telnyx), transcription, duration tracking, call logging`);
+Deno.serve({ port: PORT }, handleRequest);
