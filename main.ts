@@ -8,7 +8,7 @@ const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Realtime Relay Server v5.0.0 starting on port ${PORT}...`);
+console.log(`🚀 Realtime Relay Server v5.1.0 starting on port ${PORT}...`);
 
 // ============ LOCAL VAD IMPLEMENTATION ============
 // G.711 μ-law decode table (standard ITU-T G.711)
@@ -455,10 +455,12 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
 
     try {
       const voiceId = getElevenLabsVoiceId();
-      console.log(`[ELEVENLABS] Starting TTS for voice: ${voiceId}`);
+      console.log(`[ELEVENLABS] Starting streaming TTS for voice: ${voiceId}`);
+      const ttsStartTime = Date.now();
+      let firstChunkTime: number | null = null;
 
       const response = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000&optimize_streaming_latency=4`,
         {
           method: "POST",
           headers: {
@@ -467,8 +469,8 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           },
           body: JSON.stringify({
             text,
-            model_id: agentConfig.elevenlabsModel,
-            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+            model_id: "eleven_turbo_v2_5", // Force turbo model for lowest latency
+            voice_settings: { stability: 0.4, similarity_boost: 0.7 },
           }),
         }
       );
@@ -480,11 +482,14 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
 
       const reader = response.body.getReader();
       let buffer = new Uint8Array(0);
+      // Smaller chunk size = faster first audio (20ms of 8kHz audio)
       const CHUNK_SIZE = 160;
+      let chunksSent = 0;
 
       while (true) {
         if (currentToken !== twilioPlaybackToken) {
           reader.cancel();
+          console.log(`[ELEVENLABS] Cancelled (interrupted after ${chunksSent} chunks)`);
           return;
         }
 
@@ -492,35 +497,39 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
         if (done) break;
 
         if (value) {
+          // Track time to first audio chunk
+          if (!firstChunkTime) {
+            firstChunkTime = Date.now();
+            console.log(`[ELEVENLABS] First audio chunk in ${firstChunkTime - ttsStartTime}ms`);
+          }
+
+          // Append to buffer
           const newBuffer = new Uint8Array(buffer.length + value.length);
           newBuffer.set(buffer, 0);
           newBuffer.set(value, buffer.length);
           buffer = newBuffer;
-        }
 
-        while (buffer.length >= CHUNK_SIZE) {
-          const chunk = buffer.slice(0, CHUNK_SIZE);
-          buffer = buffer.slice(CHUNK_SIZE);
+          // Send chunks immediately as they arrive (no waiting for full buffer)
+          while (buffer.length >= CHUNK_SIZE) {
+            const chunk = buffer.slice(0, CHUNK_SIZE);
+            buffer = buffer.slice(CHUNK_SIZE);
 
-          if (streamSid && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload: base64Encode(chunk) },
-            }));
+            if (streamSid && socket.readyState === WebSocket.OPEN) {
+              sendAudioToCaller(base64Encode(chunk));
+              chunksSent++;
+            }
           }
         }
       }
 
+      // Send remaining audio
       if (buffer.length > 0 && streamSid && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: base64Encode(buffer) },
-        }));
+        sendAudioToCaller(base64Encode(buffer));
+        chunksSent++;
       }
 
-      console.log(`[ELEVENLABS] TTS complete`);
+      const totalTime = Date.now() - ttsStartTime;
+      console.log(`[ELEVENLABS] TTS complete: ${chunksSent} chunks, ${totalTime}ms total, first audio at ${firstChunkTime ? firstChunkTime - ttsStartTime : 'N/A'}ms`);
     } catch (error) {
       console.error("[ELEVENLABS] Error:", error);
     }
