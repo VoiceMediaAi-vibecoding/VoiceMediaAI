@@ -20,7 +20,6 @@
  * 5. On call end: Report duration and transcript to backend
  */
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 
 // Environment variables
@@ -46,6 +45,24 @@ if (!RELAY_SHARED_SECRET) {
 
 // OpenAI Realtime API configuration
 const OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
+
+// Deno WebSocket helper: OpenAI requires Authorization headers, so we must use Deno.connectWebSocket
+async function connectOpenAIRealtime(): Promise<WebSocket> {
+  const { socket, response } = await Deno.connectWebSocket({
+    url: OPENAI_REALTIME_URL,
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
+  });
+
+  if (response.status !== 101) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`[OpenAI] WebSocket upgrade failed: ${response.status} ${body}`);
+  }
+
+  return socket;
+}
 
 // Supported providers
 type Provider = "twilio" | "telnyx" | "unknown";
@@ -358,12 +375,12 @@ async function handleProviderConnection(
       return;
     }
 
-    openAISocket = new WebSocket(OPENAI_REALTIME_URL, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    });
+    try {
+      openAISocket = await connectOpenAIRealtime();
+    } catch (err) {
+      console.error("[OpenAI] Failed to connect:", err);
+      return;
+    }
 
     // Handle OpenAI connection
     openAISocket.onopen = () => {
