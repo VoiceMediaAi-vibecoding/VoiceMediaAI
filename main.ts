@@ -8,7 +8,7 @@ const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Realtime Relay Server v4.0.0 starting on port ${PORT}...`);
+console.log(`🚀 Realtime Relay Server v4.1.0 starting on port ${PORT}...`);
 
 async function loadAgentConfig(agentId: string) {
   const defaultConfig = {
@@ -78,11 +78,62 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   let useElevenLabs = false;
   let audioBuffer: string[] = [];
   let twilioPlaybackToken = 0;
+  
+  // Call tracking variables
+  let callStartTime: number | null = null;
+  let callLogId: string | null = null;
+  let conversationTranscript: { role: string; text: string }[] = [];
+  
+  // Multi-provider support
+  let provider: 'twilio' | 'telnyx' = 'twilio';
 
   const cleanup = () => {
     if (openAIWs) {
       openAIWs.close();
       openAIWs = null;
+    }
+  };
+
+  // Finalize call - send transcript and duration to update-call-log
+  const finalizeCall = async () => {
+    if (!callLogId) {
+      console.log("[TRACKING] No callLogId, skipping finalization");
+      return;
+    }
+
+    const duration = callStartTime 
+      ? Math.round((Date.now() - callStartTime) / 1000) 
+      : 0;
+
+    const transcript = conversationTranscript
+      .map(m => `${m.role}: ${m.text}`)
+      .join('\n');
+
+    console.log(`[TRACKING] Finalizing call ${callLogId}: ${duration}s, ${conversationTranscript.length} messages`);
+
+    try {
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/update-call-log`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${RELAY_SHARED_SECRET}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          call_log_id: callLogId,
+          duration_seconds: duration,
+          transcript: transcript,
+          status: 'completed',
+          ended_at: new Date().toISOString(),
+        }),
+      });
+
+      if (!response.ok) {
+        console.error("[TRACKING] Failed to update call log:", await response.text());
+      } else {
+        console.log("[TRACKING] Call log updated successfully");
+      }
+    } catch (error) {
+      console.error("[TRACKING] Error updating call log:", error);
     }
   };
 
@@ -176,9 +227,24 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           break;
 
         case 'start':
-          streamSid = data.start.streamSid;
-          callSid = data.start.callSid;
-          console.log(`[TWILIO] Stream started - SID: ${streamSid}, Call: ${callSid}`);
+          // Auto-detect provider based on field names
+          if (data.start?.stream_id) {
+            provider = 'telnyx';
+            streamSid = data.start.stream_id;
+            callSid = data.start.call_control_id;
+          } else {
+            provider = 'twilio';
+            streamSid = data.start.streamSid;
+            callSid = data.start.callSid;
+          }
+          
+          // Initialize call tracking
+          callStartTime = Date.now();
+          callLogId = data?.start?.customParameters?.call_log_id || null;
+          conversationTranscript = [];
+          
+          console.log(`[${provider.toUpperCase()}] Stream started - SID: ${streamSid}, Call: ${callSid}`);
+          console.log(`[TRACKING] Call log ID: ${callLogId || 'none'}, Start time: ${new Date(callStartTime).toISOString()}`);
 
           const startAgentId = data?.start?.customParameters?.agent_id || null;
           const effectiveAgentId = (startAgentId || urlAgentId || "default").toString();
@@ -253,6 +319,18 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                   console.log(`[OPENAI] Text: "${fullText.substring(0, 80)}..."`);
                   streamElevenLabsSpeech(fullText).catch(console.error);
                 }
+              } else if (response.type === 'input_audio_transcription.completed') {
+                // User speech transcription
+                if (response.transcript) {
+                  conversationTranscript.push({ role: 'user', text: response.transcript });
+                  console.log(`[TRANSCRIPT] User: "${response.transcript.substring(0, 50)}..."`);
+                }
+              } else if (response.type === 'response.audio_transcript.done') {
+                // Agent response transcription
+                if (response.transcript) {
+                  conversationTranscript.push({ role: 'agent', text: response.transcript });
+                  console.log(`[TRANSCRIPT] Agent: "${response.transcript.substring(0, 50)}..."`);
+                }
               } else if (response.type === 'input_audio_buffer.speech_started') {
                 console.log("[VAD] User speaking");
                 twilioPlaybackToken++;
@@ -282,7 +360,8 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           break;
 
         case 'stop':
-          console.log(`[TWILIO] Stream stopped`);
+          console.log(`[${provider.toUpperCase()}] Stream stopped`);
+          await finalizeCall();
           cleanup();
           break;
       }
@@ -300,7 +379,7 @@ Deno.serve({ port: PORT }, async (req) => {
   const upgradeHeader = req.headers.get("upgrade") || "";
 
   if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok", version: "4.0.0" }), { headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ status: "ok", version: "4.1.0" }), { headers: { "Content-Type": "application/json" } });
   }
 
   if (upgradeHeader.toLowerCase() === "websocket") {
@@ -310,7 +389,7 @@ Deno.serve({ port: PORT }, async (req) => {
     return response;
   }
 
-  return new Response("Realtime Relay Server v4.0.0", { status: 200 });
+  return new Response("Realtime Relay Server v4.1.0", { status: 200 });
 });
 
-console.log(`✅ Realtime Relay Server v4.0.0 running on port ${PORT}`);
+console.log(`✅ Realtime Relay Server v4.1.0 running on port ${PORT}`);
