@@ -4,7 +4,7 @@ import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/b
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
+const SUPABASE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_ANON_KEY");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
