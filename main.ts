@@ -331,11 +331,17 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                   console.log(`[OPENAI] Remaining text: "${fullText.substring(0, 80)}..."`);
                   streamElevenLabsSpeech(fullText).catch(console.error);
                 }
-              } else if (response.type === 'input_audio_transcription.completed') {
-                // User speech transcription
+              } else if (response.type === 'conversation.item.input_audio_transcription.completed') {
+                // User speech transcription (correct event name from OpenAI Realtime API)
                 if (response.transcript) {
                   conversationTranscript.push({ role: 'user', text: response.transcript });
                   console.log(`[TRANSCRIPT] User: "${response.transcript.substring(0, 50)}..."`);
+                }
+              } else if (response.type === 'input_audio_transcription.completed') {
+                // Fallback for alternative event name
+                if (response.transcript) {
+                  conversationTranscript.push({ role: 'user', text: response.transcript });
+                  console.log(`[TRANSCRIPT] User (alt): "${response.transcript.substring(0, 50)}..."`);
                 }
               } else if (response.type === 'response.audio_transcript.done') {
                 // Agent response transcription
