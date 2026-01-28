@@ -23,11 +23,16 @@
  * 5. On call end: Report duration and transcript to backend
  */
 
-const VERSION = "3.2.1";
+const VERSION = "3.2.2";
 const BUILD_DATE = "2025-01-28";
 
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 import { WebSocket as NodeWebSocket } from "npm:ws@8.18.0";
+
+function safeJsonStringify(value: unknown): string {
+  // Ensures we always send a *string* payload, and makes it easy to log.
+  return JSON.stringify(value);
+}
 
 // Environment variables
 // NOTE: avoid non-null assertions for optional integrations to prevent relay crashes.
@@ -399,6 +404,14 @@ async function handleProviderConnection(
       return;
     }
 
+    const sendOpenAI = (event: unknown) => {
+      if (!openAISocket || openAISocket.readyState !== NodeWebSocket.OPEN) return;
+      const payload = safeJsonStringify(event);
+      // Debug: confirm exact payload sent (helps isolate "invalid_json")
+      console.log(`[OpenAI] -> send len=${payload.length} preview=${payload.slice(0, 220)}`);
+      openAISocket.send(payload);
+    };
+
     // Configure session immediately since we connected via promise
     const sessionConfig = {
       type: "session.update",
@@ -421,7 +434,7 @@ async function handleProviderConnection(
       },
     };
 
-    openAISocket.send(JSON.stringify(sessionConfig));
+    sendOpenAI(sessionConfig);
     console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
 
     // Handle OpenAI messages using Node.js EventEmitter pattern
@@ -580,7 +593,10 @@ async function handleProviderConnection(
           instructions: `Say exactly this greeting, do not add anything else: "${agentConfig.greeting}"`,
         },
       };
-      openAISocket.send(JSON.stringify(greetingEvent));
+      // Send greeting via OpenAI (string payload)
+      const payload = safeJsonStringify(greetingEvent);
+      console.log(`[OpenAI] -> send len=${payload.length} preview=${payload.slice(0, 220)}`);
+      openAISocket.send(payload);
     }
   };
 
@@ -663,7 +679,12 @@ async function handleProviderConnection(
               type: "input_audio_buffer.append",
               audio: audioPayload,
             };
-            openAISocket.send(JSON.stringify(audioEvent));
+            const payload = safeJsonStringify(audioEvent);
+            // Only log occasionally to avoid flooding.
+            if (audioFrameCount === 1 || audioFrameCount % 200 === 0) {
+              console.log(`[OpenAI] -> send audio len=${payload.length} frame=${audioFrameCount}`);
+            }
+            openAISocket.send(payload);
           } else {
             // Buffer audio until session is ready (limit buffer to prevent memory issues).
             // We will drop this buffer when session.updated arrives.
