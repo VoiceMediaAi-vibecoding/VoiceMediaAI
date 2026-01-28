@@ -23,7 +23,7 @@
  * 5. On call end: Report duration and transcript to backend
  */
 
-const VERSION = "3.2.2";
+const VERSION = "3.3.0";
 const BUILD_DATE = "2025-01-28";
 
 import { encode as base64Encode } from "https://deno.land/std@0.168.0/encoding/base64.ts";
@@ -404,6 +404,7 @@ async function handleProviderConnection(
       return;
     }
 
+    // Helper to send JSON to OpenAI with debug logging
     const sendOpenAI = (event: unknown) => {
       if (!openAISocket || openAISocket.readyState !== NodeWebSocket.OPEN) return;
       const payload = safeJsonStringify(event);
@@ -412,7 +413,7 @@ async function handleProviderConnection(
       openAISocket.send(payload);
     };
 
-    // Configure session immediately since we connected via promise
+    // Prepare session config (will be sent after session.created is received)
     const sessionConfig = {
       type: "session.update",
       session: {
@@ -434,8 +435,8 @@ async function handleProviderConnection(
       },
     };
 
-    sendOpenAI(sessionConfig);
-    console.log(`[OpenAI] Session configured, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
+    // Flag to track if we've sent session.update (only send once after session.created)
+    let sessionUpdateSent = false;
 
     // Handle OpenAI messages using Node.js EventEmitter pattern
     openAISocket.on("message", async (rawData: Buffer | string, isBinary: boolean) => {
@@ -456,16 +457,21 @@ async function handleProviderConnection(
 
       switch (data.type) {
         case "session.created":
-          console.log("[OpenAI] Session created");
-          // Do not mark ready here; wait for session.updated.
+          console.log("[OpenAI] Session created - now sending session.update");
+          // CRITICAL: Only send session.update AFTER receiving session.created
+          if (!sessionUpdateSent) {
+            sessionUpdateSent = true;
+            sendOpenAI(sessionConfig);
+            console.log(`[OpenAI] Session update sent, modalities: ${useElevenLabs ? "text" : "text+audio"}`);
+          }
           break;
 
         case "session.updated":
-          console.log("[OpenAI] Session updated");
+          console.log("[OpenAI] Session updated - ready to receive audio");
           if (!sessionReady) {
             sessionReady = true;
             if (pendingAudioFrames.length > 0) {
-              console.log(`[Relay] Dropping ${pendingAudioFrames.length} buffered audio frames (waiting for session.updated)`);
+              console.log(`[Relay] Dropping ${pendingAudioFrames.length} buffered audio frames (arrived before session ready)`);
               pendingAudioFrames.length = 0;
             }
           }
