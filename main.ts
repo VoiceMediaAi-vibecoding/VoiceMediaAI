@@ -615,7 +615,7 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
             }
 
             // IMPORTANT: modalities is ["text"] for ElevenLabs to prevent audio_output_tokens
-            const sessionConfig = {
+             const sessionConfig = {
               type: "session.update",
               session: {
                 modalities: useElevenLabs ? ["text"] : ["text", "audio"],
@@ -624,7 +624,9 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
                 input_audio_format: "g711_ulaw",
                 output_audio_format: "g711_ulaw",
                 input_audio_transcription: transcriptionConfig,
-                turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 800 },
+                 // Faster turn-taking: end user turn sooner so the agent responds quicker.
+                 // (Local VAD already filters silence; this server VAD is for turn detection.)
+                 turn_detection: { type: "server_vad", threshold: 0.45, prefix_padding_ms: 200, silence_duration_ms: 400 },
               },
             };
 
@@ -632,7 +634,11 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
             console.log(`[OPENAI] Session config sent (modalities: ${useElevenLabs ? '["text"]' : '["text", "audio"]'})`);
           };
 
-          openAIWs.onmessage = (msg) => {
+           // Timing helpers to understand perceived latency
+           let lastUserTranscriptAt: number | null = null;
+           let lastAssistantFirstDeltaAt: number | null = null;
+
+           openAIWs.onmessage = (msg) => {
             try {
               const response = JSON.parse(msg.data as string);
 
@@ -654,7 +660,11 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
                 }));
               } else if (response.type === 'response.audio.delta' && !useElevenLabs) {
                 sendAudioToCaller(response.delta);
-              } else if (response.type === 'response.text.delta' && useElevenLabs) {
+               } else if (response.type === 'response.text.delta' && useElevenLabs) {
+                 if (lastUserTranscriptAt && !lastAssistantFirstDeltaAt) {
+                   lastAssistantFirstDeltaAt = Date.now();
+                   console.log(`[LATENCY] First assistant token ${(lastAssistantFirstDeltaAt - lastUserTranscriptAt)}ms after user transcript`);
+                 }
                 audioBuffer.push(response.delta);
               } else if (response.type === 'response.text.done') {
                 // For ElevenLabs mode: capture agent transcript from text response
@@ -696,15 +706,19 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
                   console.log(`[OPENAI] Remaining text: "${fullText.substring(0, 80)}..."`);
                   streamElevenLabsSpeech(fullText).catch(console.error);
                 }
-              } else if (response.type === 'conversation.item.input_audio_transcription.completed') {
+               } else if (response.type === 'conversation.item.input_audio_transcription.completed') {
                 // User speech transcription (correct event name from OpenAI Realtime API)
                 if (response.transcript) {
+                   lastUserTranscriptAt = Date.now();
+                   lastAssistantFirstDeltaAt = null;
                   conversationTranscript.push({ role: 'user', text: response.transcript });
                   console.log(`[TRANSCRIPT] User: "${response.transcript.substring(0, 50)}..."`);
                 }
               } else if (response.type === 'input_audio_transcription.completed') {
                 // Fallback for alternative event name
                 if (response.transcript) {
+                   lastUserTranscriptAt = Date.now();
+                   lastAssistantFirstDeltaAt = null;
                   conversationTranscript.push({ role: 'user', text: response.transcript });
                   console.log(`[TRANSCRIPT] User (alt): "${response.transcript.substring(0, 50)}..."`);
                 }
@@ -790,9 +804,9 @@ Deno.serve({ port: PORT }, async (req) => {
   const url = new URL(req.url);
   const upgradeHeader = req.headers.get("upgrade") || "";
 
-  if (url.pathname === "/health") {
-    return new Response(JSON.stringify({ status: "ok", version: "5.0.0" }), { headers: { "Content-Type": "application/json" } });
-  }
+   if (url.pathname === "/health") {
+     return new Response(JSON.stringify({ status: "ok", version: "5.1.0" }), { headers: { "Content-Type": "application/json" } });
+   }
 
   if (upgradeHeader.toLowerCase() === "websocket") {
     const agentId = url.searchParams.get('agentId');
