@@ -10,14 +10,14 @@ const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
 console.log(`🚀 Realtime Relay Server starting on port ${PORT}...`);
 
-// Simple Supabase client for database operations (using anon key with RLS)
+// Simple Supabase client for database operations
 async function supabaseQuery(table: string, method: string, body?: object, filters?: string) {
   const url = `${SUPABASE_URL}/rest/v1/${table}${filters ? `?${filters}` : ''}`;
   const response = await fetch(url, {
     method,
     headers: {
-      'apikey': SUPABASE_ANON_KEY!,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'apikey': SUPABASE_KEY!,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
       'Content-Type': 'application/json',
       'Prefer': 'return=minimal',
     },
@@ -34,6 +34,7 @@ async function loadAgentConfig(agentId: string) {
     customVoiceId: null as string | null,
     language: "es-ES",
     name: "Asistente Virtual",
+    greeting: null as string | null,
   };
 
   try {
@@ -41,8 +42,8 @@ async function loadAgentConfig(agentId: string) {
       `${SUPABASE_URL}/rest/v1/agents?id=eq.${agentId}&select=*`,
       {
         headers: {
-          'apikey': SUPABASE_ANON_KEY!,
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'apikey': SUPABASE_KEY!,
+          'Authorization': `Bearer ${SUPABASE_KEY}`,
         },
       }
     );
@@ -57,6 +58,7 @@ async function loadAgentConfig(agentId: string) {
 
     console.log(`✅ Loaded agent: ${agent.name} (${agent.id})`);
     console.log(`   Voice Provider: ${agent.voice_provider}, Voice: ${agent.voice}`);
+    console.log(`   Greeting: ${agent.greeting?.substring(0, 50)}...`);
 
     return {
       systemPrompt: agent.system_prompt || defaultConfig.systemPrompt,
@@ -65,6 +67,7 @@ async function loadAgentConfig(agentId: string) {
       customVoiceId: agent.elevenlabs_voice_id,
       language: agent.language || "es-ES",
       name: agent.name || defaultConfig.name,
+      greeting: agent.greeting || null,
     };
   } catch (e) {
     console.error("Error fetching agent config:", e);
@@ -114,6 +117,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
     customVoiceId: null as string | null,
     language: "es-ES",
     name: "Asistente",
+    greeting: null as string | null,
   };
   let useElevenLabs = false;
   let audioBuffer: string[] = [];
@@ -141,7 +145,9 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
   };
 
   const getElevenLabsVoiceId = () => {
-    if (agentConfig.voiceProvider === "custom") return agentConfig.customVoiceId;
+    if (agentConfig.voiceProvider === "custom" || agentConfig.voiceProvider === "elevenlabs") {
+      return agentConfig.customVoiceId;
+    }
     return agentConfig.voice;
   };
 
@@ -254,7 +260,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           callStartTime = performance.now();
           console.log(`[TWILIO] Stream started - SID: ${streamSid}, Call: ${callSid}`);
 
-          // Get agent ID from custom parameters or URL
+          // Get agent ID from custom parameters (Twilio sends as agent_id)
           const startAgentId = data?.start?.customParameters?.agent_id || null;
           const effectiveAgentId = (startAgentId || urlAgentId || "default").toString();
           currentAgentId = effectiveAgentId !== "default" ? effectiveAgentId : null;
@@ -308,13 +314,19 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
                 metricsData.sessionSetupMs = Math.round(performance.now() - callStartTime!);
                 console.log(`[OPENAI] Session updated in ${metricsData.sessionSetupMs}ms`);
 
-                // Send initial greeting
+                // Send initial greeting using agent's configured greeting
                 responseStartTime = performance.now();
+                const greetingInstruction = agentConfig.greeting 
+                  ? `Di exactamente este saludo, no agregues nada más: "${agentConfig.greeting}"`
+                  : "Saluda al usuario de forma breve y amigable. Preséntate con tu nombre y pregunta en qué puedes ayudar.";
+                
+                console.log(`[GREETING] Using: ${greetingInstruction.substring(0, 80)}...`);
+                
                 openAIWs?.send(JSON.stringify({
                   type: "response.create",
                   response: {
                     modalities: useElevenLabs ? ["text"] : ["text", "audio"],
-                    instructions: "Saluda al usuario de forma breve y amigable. Preséntate con tu nombre y pregunta en qué puedes ayudar."
+                    instructions: greetingInstruction
                   }
                 }));
               } else if (response.type === 'response.audio.delta' && !useElevenLabs) {
