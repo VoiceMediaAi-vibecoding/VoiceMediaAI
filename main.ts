@@ -233,6 +233,10 @@ async function loadAgentConfig(agentId: string) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente Virtual",
     greeting: null as string | null,
+    // Local VAD settings (in dB and ms) - NOT the same as OpenAI's server_vad threshold (0-1 scale)
+    localVadThresholdDb: -40,      // dB threshold for voice detection
+    localVadSilenceMs: 800,        // ms of silence before stopping
+    localVadPrefixMs: 300,         // ms of audio to buffer before voice
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
     vadThreshold: -40,
@@ -266,6 +270,9 @@ async function loadAgentConfig(agentId: string) {
     console.log(`   ElevenLabs Voice ID: ${data.elevenlabsVoiceId}`);
     console.log(`   Greeting: ${data.greeting?.substring(0, 80)}...`);
 
+    // IMPORTANT: data.vadThreshold from DB is for OpenAI's server_vad (0-1 scale)
+    // Local VAD needs dB values (negative, like -40dB). 
+    // We use fixed sensible defaults for local VAD.
     return {
       systemPrompt: data.systemPrompt || defaultConfig.systemPrompt,
       voice: data.voice || "alloy",
@@ -276,9 +283,10 @@ async function loadAgentConfig(agentId: string) {
       greeting: data.greeting || null,
       whisperLanguage: data.whisperLanguage || "es",
       whisperPrompt: data.whisperPrompt || null,
-      vadThreshold: data.vadThreshold ?? defaultConfig.vadThreshold,
-      silenceDurationMs: data.silenceDurationMs ?? defaultConfig.silenceDurationMs,
-      prefixPaddingMs: data.prefixPaddingMs ?? defaultConfig.prefixPaddingMs,
+      // Use fixed dB threshold for local VAD (NOT the 0-1 scale from DB)
+      localVadThresholdDb: defaultConfig.localVadThresholdDb,
+      localVadSilenceMs: data.silenceDurationMs ?? defaultConfig.localVadSilenceMs,
+      localVadPrefixMs: data.prefixPaddingMs ?? defaultConfig.localVadPrefixMs,
     };
   } catch (e) {
     console.error("[AGENT] Error fetching agent config:", e);
@@ -308,9 +316,10 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
     greeting: null as string | null,
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
-    vadThreshold: -40,
-    silenceDurationMs: 800,
-    prefixPaddingMs: 300,
+    // Local VAD settings (dB-based, NOT 0-1 scale)
+    localVadThresholdDb: -40,
+    localVadSilenceMs: 800,
+    localVadPrefixMs: 300,
   };
   let useElevenLabs = false;
   let audioBuffer: string[] = [];
@@ -565,12 +574,13 @@ function handleWebSocket(socket: WebSocket, urlParams: RelayUrlParams) {
           useElevenLabs = agentConfig.voiceProvider === "elevenlabs" || agentConfig.voiceProvider === "custom";
           console.log(`[TTS] Using ${useElevenLabs ? "ElevenLabs" : "OpenAI"}`);
           
-          // Initialize local VAD with agent config
+          // Initialize local VAD with proper dB-based threshold
           localVAD = new LocalVAD({
-            silenceThresholdDb: agentConfig.vadThreshold,
-            silenceDurationMs: agentConfig.silenceDurationMs,
-            prefixBufferMs: agentConfig.prefixPaddingMs,
+            silenceThresholdDb: agentConfig.localVadThresholdDb,
+            silenceDurationMs: agentConfig.localVadSilenceMs,
+            prefixBufferMs: agentConfig.localVadPrefixMs,
           });
+          console.log(`[VAD] Config: threshold=${agentConfig.localVadThresholdDb}dB, silence=${agentConfig.localVadSilenceMs}ms`);
 
           // Connect to OpenAI Realtime API using native Deno WebSocket
           const openAIUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
