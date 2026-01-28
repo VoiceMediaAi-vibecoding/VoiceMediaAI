@@ -62,7 +62,7 @@ async function loadAgentConfig(agentId: string) {
       systemPrompt: agent.system_prompt || defaultConfig.systemPrompt,
       voice: agent.voice || "alloy",
       voiceProvider: agent.voice_provider || "openai",
-      customVoiceId: agent.custom_voice_id,
+      customVoiceId: agent.elevenlabs_voice_id,
       language: agent.language || "es-ES",
       name: agent.name || defaultConfig.name,
     };
@@ -255,7 +255,7 @@ function handleWebSocket(socket: WebSocket, urlAgentId: string | null) {
           console.log(`[TWILIO] Stream started - SID: ${streamSid}, Call: ${callSid}`);
 
           // Get agent ID from custom parameters or URL
-          const startAgentId = data?.start?.customParameters?.agentId || data?.start?.customParameters?.AgentId || null;
+          const startAgentId = data?.start?.customParameters?.agent_id || null;
           const effectiveAgentId = (startAgentId || urlAgentId || "default").toString();
           currentAgentId = effectiveAgentId !== "default" ? effectiveAgentId : null;
           console.log(`[AGENT] Loading config for: ${effectiveAgentId}`);
