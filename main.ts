@@ -119,20 +119,20 @@ function writeString(view: DataView, offset: number, str: string): void {
 }
 
 // ============ SYSTEM PROMPT TRUNCATION ============
-// Truncate system prompt to avoid extremely long LLM processing times
-const MAX_SYSTEM_PROMPT_CHARS = 4000; // ~1000 tokens, keeps LLM fast
+// Aggressive truncation for fast LLM responses
+const MAX_SYSTEM_PROMPT_CHARS = 2000; // ~500 tokens for FAST responses
 
 function truncateSystemPrompt(prompt: string): string {
   if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) return prompt;
   
-  // Try to find a natural break point
+  // Find a natural break point
   const truncated = prompt.substring(0, MAX_SYSTEM_PROMPT_CHARS);
   const lastPeriod = truncated.lastIndexOf('.');
   const lastNewline = truncated.lastIndexOf('\n');
-  const breakPoint = Math.max(lastPeriod, lastNewline, MAX_SYSTEM_PROMPT_CHARS - 200);
+  const breakPoint = Math.max(lastPeriod, lastNewline, MAX_SYSTEM_PROMPT_CHARS - 100);
   
   const result = prompt.substring(0, breakPoint + 1);
-  console.log(`[LLM] Truncated system prompt: ${prompt.length} -> ${result.length} chars`);
+  console.log(`[LLM] Truncated: ${prompt.length} -> ${result.length} chars`);
   return result;
 }
 
@@ -352,16 +352,19 @@ async function generateLLMResponse(
   systemPrompt: string,
   conversationHistory: ChatMessage[],
   userMessage: string,
-  temperature: number = 0.8
+  temperature: number = 0.7
 ): Promise<LLMResult> {
   const startTime = Date.now();
 
-  // Truncate system prompt to keep LLM fast
+  // Aggressive truncation for speed
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
+
+  // Only keep last 4 messages for minimal context, maximum speed
+  const recentHistory = conversationHistory.slice(-4);
 
   const messages: ChatMessage[] = [
     { role: 'system', content: truncatedPrompt },
-    ...conversationHistory.slice(-6), // Reduced from 10 to 6 messages for speed
+    ...recentHistory,
     { role: 'user', content: userMessage },
   ];
 
@@ -375,7 +378,7 @@ async function generateLLMResponse(
       model: 'gpt-4o-mini',
       messages,
       temperature,
-      max_tokens: 300, // Reduced from 500 for faster responses
+      max_tokens: 150, // Very short for fast responses
     }),
   });
 
@@ -390,7 +393,7 @@ async function generateLLMResponse(
   const inputTokens = result.usage?.prompt_tokens || 0;
   const outputTokens = result.usage?.completion_tokens || 0;
 
-  console.log(`[LLM] Response: "${text.substring(0, 60)}..." (${inputTokens}+${outputTokens} tokens, ${elapsed}ms)`);
+  console.log(`[LLM] ${elapsed}ms (${inputTokens}+${outputTokens} tokens): "${text.substring(0, 50)}..."`);
 
   return { text, inputTokens, outputTokens };
 }
@@ -700,11 +703,11 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       conversationTranscript.push({ role: 'user', text: userText });
       conversationHistory.push({ role: 'user', content: userText });
 
-      // === LLM ===
+      // === LLM === (pass minimal history for speed)
       const llmStartTime = Date.now();
       const { text: assistantText, inputTokens, outputTokens } = await generateLLMResponse(
         agentConfig.systemPrompt,
-        conversationHistory.slice(0, -1), // Exclude the just-added user message
+        conversationHistory.slice(-4), // Only last 4 messages
         userText,
         agentConfig.temperature
       );
