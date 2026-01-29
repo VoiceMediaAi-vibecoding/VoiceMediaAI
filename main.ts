@@ -15,6 +15,9 @@ const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
 console.log(`🚀 Pipeline Relay Server v6.1.0 starting on port ${PORT}...`);
 console.log(`   Mode: STT (Deepgram/Whisper) + LLM (Chat Completions) + TTS (ElevenLabs)`);
+console.log(`   DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY ? '✅ Configured (' + DEEPGRAM_API_KEY.substring(0, 8) + '...)' : '❌ MISSING'}`);
+console.log(`   OPENAI_API_KEY: ${OPENAI_API_KEY ? '✅ Configured' : '❌ MISSING'}`);
+console.log(`   ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ MISSING'}`);
 
 // ============ G.711 μ-law CODEC ============
 const ULAW_DECODE_TABLE: Int16Array = new Int16Array([
