@@ -7,13 +7,14 @@ import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/b
 // Load environment variables
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 const ELEVENLABS_API_KEY = Deno.env.get("ELEVENLABS_API_KEY");
+const DEEPGRAM_API_KEY = Deno.env.get("DEEPGRAM_API_KEY");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Pipeline Relay Server v6.0.0 starting on port ${PORT}...`);
-console.log(`   Mode: STT (Whisper) + LLM (Chat Completions) + TTS (ElevenLabs)`);
+console.log(`🚀 Pipeline Relay Server v6.1.0 starting on port ${PORT}...`);
+console.log(`   Mode: STT (Deepgram/Whisper) + LLM (Chat Completions) + TTS (ElevenLabs)`);
 
 // ============ G.711 μ-law CODEC ============
 const ULAW_DECODE_TABLE: Int16Array = new Int16Array([
@@ -295,7 +296,68 @@ class TurnManager {
   }
 }
 
-// ============ WHISPER STT ============
+// ============ DEEPGRAM STT ============
+// Uses Nova-2 model optimized for phone calls with ~300ms latency
+async function transcribeWithDeepgram(
+  pcmBuffer: Int16Array,
+  language: string,
+  _prompt?: string | null // Deepgram uses keywords instead of prompts
+): Promise<{ text: string; durationSec: number }> {
+  const startTime = Date.now();
+  const wavBuffer = createWavBuffer(pcmBuffer, 8000);
+  const durationSec = pcmBuffer.length / 8000;
+
+  // Build query parameters for Deepgram
+  const params = new URLSearchParams({
+    model: 'nova-2-phonecall', // Optimized for phone audio
+    smart_format: 'true',
+    punctuate: 'true',
+    encoding: 'linear16',
+    sample_rate: '8000',
+  });
+
+  // Map language codes (Whisper uses ISO 639-1, Deepgram uses BCP-47)
+  if (language && language !== 'auto') {
+    // Common mappings for Spanish variants
+    const langMap: Record<string, string> = {
+      'es': 'es',
+      'es-419': 'es-419', // Latin American Spanish
+      'en': 'en-US',
+      'pt': 'pt-BR',
+    };
+    params.set('language', langMap[language] || language);
+  } else {
+    params.set('detect_language', 'true');
+  }
+
+  const response = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Token ${DEEPGRAM_API_KEY}`,
+      'Content-Type': 'audio/wav',
+    },
+    body: wavBuffer,
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    console.error(`[STT] Deepgram error: ${response.status} - ${error}`);
+    throw new Error(`Deepgram API error: ${response.status} - ${error}`);
+  }
+
+  const result = await response.json();
+  const elapsed = Date.now() - startTime;
+  
+  // Extract transcript from Deepgram response
+  const transcript = result.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
+  const confidence = result.results?.channels?.[0]?.alternatives?.[0]?.confidence || 0;
+  
+  console.log(`[STT] Deepgram: "${transcript.substring(0, 60)}..." (${durationSec.toFixed(1)}s audio, ${elapsed}ms, conf=${(confidence * 100).toFixed(0)}%)`);
+
+  return { text: transcript, durationSec };
+}
+
+// Fallback to Whisper if Deepgram fails or is not configured
 async function transcribeWithWhisper(
   pcmBuffer: Int16Array,
   language: string,
@@ -331,9 +393,26 @@ async function transcribeWithWhisper(
 
   const result = await response.json();
   const elapsed = Date.now() - startTime;
-  console.log(`[STT] Whisper: "${result.text.substring(0, 60)}..." (${durationSec.toFixed(1)}s audio, ${elapsed}ms latency)`);
+  console.log(`[STT] Whisper fallback: "${result.text.substring(0, 60)}..." (${durationSec.toFixed(1)}s audio, ${elapsed}ms latency)`);
 
   return { text: result.text, durationSec };
+}
+
+// Smart STT function: Use Deepgram if available, fallback to Whisper
+async function transcribeAudio(
+  pcmBuffer: Int16Array,
+  language: string,
+  prompt?: string | null
+): Promise<{ text: string; durationSec: number }> {
+  if (DEEPGRAM_API_KEY) {
+    try {
+      return await transcribeWithDeepgram(pcmBuffer, language, prompt);
+    } catch (error) {
+      console.error('[STT] Deepgram failed, falling back to Whisper:', error);
+      return await transcribeWithWhisper(pcmBuffer, language, prompt);
+    }
+  }
+  return await transcribeWithWhisper(pcmBuffer, language, prompt);
 }
 
 // ============ LLM CHAT COMPLETIONS ============
@@ -769,9 +848,9 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     try {
       metrics.turnsCount++;
 
-      // === STT ===
+      // === STT (Deepgram primary, Whisper fallback) ===
       const sttStartTime = Date.now();
-      const { text: userText, durationSec } = await transcribeWithWhisper(
+      const { text: userText, durationSec } = await transcribeAudio(
         pcmBuffer,
         agentConfig.whisperLanguage,
         agentConfig.whisperPrompt
