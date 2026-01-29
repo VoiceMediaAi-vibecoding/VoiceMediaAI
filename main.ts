@@ -118,6 +118,24 @@ function writeString(view: DataView, offset: number, str: string): void {
   }
 }
 
+// ============ SYSTEM PROMPT TRUNCATION ============
+// Truncate system prompt to avoid extremely long LLM processing times
+const MAX_SYSTEM_PROMPT_CHARS = 4000; // ~1000 tokens, keeps LLM fast
+
+function truncateSystemPrompt(prompt: string): string {
+  if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) return prompt;
+  
+  // Try to find a natural break point
+  const truncated = prompt.substring(0, MAX_SYSTEM_PROMPT_CHARS);
+  const lastPeriod = truncated.lastIndexOf('.');
+  const lastNewline = truncated.lastIndexOf('\n');
+  const breakPoint = Math.max(lastPeriod, lastNewline, MAX_SYSTEM_PROMPT_CHARS - 200);
+  
+  const result = prompt.substring(0, breakPoint + 1);
+  console.log(`[LLM] Truncated system prompt: ${prompt.length} -> ${result.length} chars`);
+  return result;
+}
+
 // ============ TURN MANAGER ============
 interface TurnResult {
   type: 'turn_complete';
@@ -150,7 +168,7 @@ class TurnManager {
   constructor(config: Partial<VADConfig> = {}) {
     this.config = {
       silenceThresholdDb: config.silenceThresholdDb ?? -40,
-      silenceDurationMs: config.silenceDurationMs ?? 800,
+      silenceDurationMs: config.silenceDurationMs ?? 600, // Reduced from 800ms for faster response
       prefixBufferMs: config.prefixBufferMs ?? 300,
       minTurnDurationMs: config.minTurnDurationMs ?? 300,
       sampleRate: config.sampleRate ?? 8000,
@@ -338,9 +356,12 @@ async function generateLLMResponse(
 ): Promise<LLMResult> {
   const startTime = Date.now();
 
+  // Truncate system prompt to keep LLM fast
+  const truncatedPrompt = truncateSystemPrompt(systemPrompt);
+
   const messages: ChatMessage[] = [
-    { role: 'system', content: systemPrompt },
-    ...conversationHistory.slice(-10), // Last 10 messages max
+    { role: 'system', content: truncatedPrompt },
+    ...conversationHistory.slice(-6), // Reduced from 10 to 6 messages for speed
     { role: 'user', content: userMessage },
   ];
 
@@ -354,7 +375,7 @@ async function generateLLMResponse(
       model: 'gpt-4o-mini',
       messages,
       temperature,
-      max_tokens: 500, // Keep responses concise for phone calls
+      max_tokens: 300, // Reduced from 500 for faster responses
     }),
   });
 
@@ -415,7 +436,7 @@ async function loadAgentConfig(agentId: string) {
     greeting: null as string | null,
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
-    silenceDurationMs: 800,
+    silenceDurationMs: 600, // Reduced default for faster response
     prefixPaddingMs: 300,
     temperature: 0.8,
   };
@@ -454,7 +475,7 @@ async function loadAgentConfig(agentId: string) {
       greeting: data.greeting || null,
       whisperLanguage: data.whisperLanguage || "es",
       whisperPrompt: data.whisperPrompt || null,
-      silenceDurationMs: data.silenceDurationMs ?? 800,
+      silenceDurationMs: Math.min(data.silenceDurationMs ?? 600, 800), // Cap at 800ms max
       prefixPaddingMs: data.prefixPaddingMs ?? 300,
       temperature: data.temperature ?? 0.8,
     };
@@ -489,7 +510,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     greeting: null as string | null,
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
-    silenceDurationMs: 800,
+    silenceDurationMs: 600,
     prefixPaddingMs: 300,
     temperature: 0.8,
   };
@@ -498,6 +519,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
   let twilioPlaybackToken = 0;
   let isProcessingTurn = false;
   let isTTSPlaying = false;
+  let isCallEnded = false; // Track if call has ended
 
   // Conversation state
   const conversationHistory: ChatMessage[] = [];
@@ -520,12 +542,12 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
 
   // Helpers
   const sendToCaller = (msg: Record<string, unknown>) => {
-    if (socket.readyState !== WebSocket.OPEN) return;
+    if (socket.readyState !== WebSocket.OPEN || isCallEnded) return;
     socket.send(JSON.stringify(msg));
   };
 
   const sendAudioToCaller = (payloadBase64: string) => {
-    if (!streamSid) return;
+    if (!streamSid || isCallEnded) return;
     if (provider === 'telnyx') {
       sendToCaller({ event: 'media', stream_id: streamSid, media: { payload: payloadBase64 } });
     } else {
@@ -534,7 +556,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
   };
 
   const clearCallerAudio = () => {
-    if (!streamSid) return;
+    if (!streamSid || isCallEnded) return;
     if (provider === 'telnyx') {
       sendToCaller({ event: 'clear', stream_id: streamSid });
     } else {
@@ -544,6 +566,12 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
 
   // ElevenLabs TTS streaming
   async function streamElevenLabsTTS(text: string, currentToken: number): Promise<void> {
+    // Check if call is still active before starting TTS
+    if (isCallEnded || socket.readyState !== WebSocket.OPEN) {
+      console.log(`[TTS] Skipped - call ended`);
+      return;
+    }
+
     const ttsStartTime = Date.now();
     let firstChunkTime: number | null = null;
 
@@ -580,7 +608,8 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       let chunksSent = 0;
 
       while (true) {
-        if (currentToken !== twilioPlaybackToken) {
+        // Check interruption or call end
+        if (currentToken !== twilioPlaybackToken || isCallEnded || socket.readyState !== WebSocket.OPEN) {
           reader.cancel();
           console.log(`[TTS] Interrupted after ${chunksSent} chunks`);
           return;
@@ -606,7 +635,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
             const chunk = buffer.slice(0, CHUNK_SIZE);
             buffer = buffer.slice(CHUNK_SIZE);
 
-            if (streamSid && socket.readyState === WebSocket.OPEN) {
+            if (streamSid && socket.readyState === WebSocket.OPEN && !isCallEnded) {
               sendAudioToCaller(base64Encode(chunk));
               chunksSent++;
             }
@@ -615,7 +644,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       }
 
       // Send remaining
-      if (buffer.length > 0 && streamSid && socket.readyState === WebSocket.OPEN) {
+      if (buffer.length > 0 && streamSid && socket.readyState === WebSocket.OPEN && !isCallEnded) {
         sendAudioToCaller(base64Encode(buffer));
         chunksSent++;
       }
@@ -629,8 +658,8 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
 
   // Process a complete user turn
   async function processTurn(pcmBuffer: Int16Array, turnDurationMs: number): Promise<void> {
-    if (isProcessingTurn) {
-      console.log("[TURN] Already processing, skipping");
+    if (isProcessingTurn || isCallEnded) {
+      console.log("[TURN] Already processing or call ended, skipping");
       return;
     }
 
@@ -660,8 +689,8 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
         return;
       }
 
-      // Check if interrupted
-      if (currentPlaybackToken !== twilioPlaybackToken) {
+      // Check if interrupted or call ended
+      if (currentPlaybackToken !== twilioPlaybackToken || isCallEnded) {
         console.log("[TURN] Interrupted during STT");
         isProcessingTurn = false;
         isTTSPlaying = false;
@@ -691,8 +720,8 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
         return;
       }
 
-      // Check if interrupted
-      if (currentPlaybackToken !== twilioPlaybackToken) {
+      // Check if interrupted or call ended
+      if (currentPlaybackToken !== twilioPlaybackToken || isCallEnded) {
         console.log("[TURN] Interrupted during LLM");
         isProcessingTurn = false;
         isTTSPlaying = false;
@@ -827,7 +856,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
 
           agentConfig = await loadAgentConfig(effectiveAgentId);
 
-          // Initialize turn manager
+          // Initialize turn manager with faster settings
           turnManager = new TurnManager({
             silenceThresholdDb: -40,
             silenceDurationMs: agentConfig.silenceDurationMs,
@@ -849,7 +878,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
           break;
 
         case 'media':
-          if (turnManager && socket.readyState === WebSocket.OPEN) {
+          if (turnManager && socket.readyState === WebSocket.OPEN && !isCallEnded) {
             // Detect barge-in while TTS is playing
             if (isTTSPlaying) {
               const pcm = decodeUlaw(data.media.payload);
@@ -875,6 +904,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
           break;
 
         case 'stop':
+          isCallEnded = true; // Mark call as ended immediately
           console.log(`[${provider.toUpperCase()}] Stream stopped`);
 
           // Log final metrics
@@ -900,7 +930,10 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
   };
 
   socket.onerror = (error) => console.error(`[${provider.toUpperCase()}] WebSocket error:`, error);
-  socket.onclose = () => console.log(`[${provider.toUpperCase()}] WebSocket closed`);
+  socket.onclose = () => {
+    isCallEnded = true;
+    console.log(`[${provider.toUpperCase()}] WebSocket closed`);
+  };
 }
 
 // ============ HTTP SERVER ============
