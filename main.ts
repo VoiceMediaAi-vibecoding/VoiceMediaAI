@@ -298,10 +298,15 @@ class TurnManager {
 
 // ============ DEEPGRAM STT ============
 // Uses Nova-2 model optimized for phone calls with ~300ms latency
+interface DeepgramConfig {
+  model: string;
+  language: string;
+  keywords: string[];
+}
+
 async function transcribeWithDeepgram(
   pcmBuffer: Int16Array,
-  language: string,
-  _prompt?: string | null // Deepgram uses keywords instead of prompts
+  config: DeepgramConfig
 ): Promise<{ text: string; durationSec: number }> {
   const startTime = Date.now();
   const wavBuffer = createWavBuffer(pcmBuffer, 8000);
@@ -309,25 +314,26 @@ async function transcribeWithDeepgram(
 
   // Build query parameters for Deepgram
   const params = new URLSearchParams({
-    model: 'nova-2-phonecall', // Optimized for phone audio
+    model: config.model || 'nova-2-phonecall',
     smart_format: 'true',
     punctuate: 'true',
     encoding: 'linear16',
     sample_rate: '8000',
   });
 
-  // Map language codes (Whisper uses ISO 639-1, Deepgram uses BCP-47)
-  if (language && language !== 'auto') {
-    // Common mappings for Spanish variants
-    const langMap: Record<string, string> = {
-      'es': 'es',
-      'es-419': 'es-419', // Latin American Spanish
-      'en': 'en-US',
-      'pt': 'pt-BR',
-    };
-    params.set('language', langMap[language] || language);
+  // Set language
+  if (config.language && config.language !== 'auto') {
+    params.set('language', config.language);
   } else {
     params.set('detect_language', 'true');
+  }
+
+  // Add keywords for better recognition
+  if (config.keywords && config.keywords.length > 0) {
+    // Deepgram accepts keywords as repeated params
+    config.keywords.forEach(keyword => {
+      params.append('keywords', keyword.trim());
+    });
   }
 
   const response = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
@@ -398,21 +404,37 @@ async function transcribeWithWhisper(
   return { text: result.text, durationSec };
 }
 
-// Smart STT function: Use Deepgram if available, fallback to Whisper
+// STT configuration interface
+interface STTConfig {
+  sttProvider: 'whisper' | 'deepgram';
+  whisperLanguage: string;
+  whisperPrompt: string | null;
+  deepgramModel: string;
+  deepgramLanguage: string;
+  deepgramKeywords: string[];
+}
+
+// Smart STT function: Uses agent's configured provider
 async function transcribeAudio(
   pcmBuffer: Int16Array,
-  language: string,
-  prompt?: string | null
+  config: STTConfig
 ): Promise<{ text: string; durationSec: number }> {
-  if (DEEPGRAM_API_KEY) {
+  // Use Deepgram if configured and API key available
+  if (config.sttProvider === 'deepgram' && DEEPGRAM_API_KEY) {
     try {
-      return await transcribeWithDeepgram(pcmBuffer, language, prompt);
+      return await transcribeWithDeepgram(pcmBuffer, {
+        model: config.deepgramModel,
+        language: config.deepgramLanguage,
+        keywords: config.deepgramKeywords,
+      });
     } catch (error) {
       console.error('[STT] Deepgram failed, falling back to Whisper:', error);
-      return await transcribeWithWhisper(pcmBuffer, language, prompt);
+      return await transcribeWithWhisper(pcmBuffer, config.whisperLanguage, config.whisperPrompt);
     }
   }
-  return await transcribeWithWhisper(pcmBuffer, language, prompt);
+  
+  // Use Whisper
+  return await transcribeWithWhisper(pcmBuffer, config.whisperLanguage, config.whisperPrompt);
 }
 
 // ============ LLM CHAT COMPLETIONS ============
@@ -611,8 +633,13 @@ async function loadAgentConfig(agentId: string) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente Virtual",
     greeting: null as string | null,
+    // STT settings
+    sttProvider: "deepgram" as "whisper" | "deepgram",
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
+    deepgramModel: "nova-2-phonecall",
+    deepgramLanguage: "es-419",
+    deepgramKeywords: [] as string[],
     silenceDurationMs: 600, // Reduced default for faster response
     prefixPaddingMs: 300,
     temperature: 0.8,
@@ -638,8 +665,10 @@ async function loadAgentConfig(agentId: string) {
       return defaultConfig;
     }
 
+    const sttProvider = data.sttProvider || 'deepgram';
     console.log(`✅ Loaded agent: ${data.name} (${data.id})`);
     console.log(`   Voice: ElevenLabs ${data.elevenlabsVoiceId || 'default'}`);
+    console.log(`   STT: ${sttProvider} (${sttProvider === 'deepgram' ? data.deepgramModel : 'whisper-1'})`);
     console.log(`   Greeting: ${data.greeting?.substring(0, 60) || 'none'}...`);
 
     return {
@@ -650,8 +679,13 @@ async function loadAgentConfig(agentId: string) {
       elevenlabsModel: data.elevenlabsModel || "eleven_turbo_v2_5",
       name: data.name || defaultConfig.name,
       greeting: data.greeting || null,
+      // STT settings
+      sttProvider: sttProvider as "whisper" | "deepgram",
       whisperLanguage: data.whisperLanguage || "es",
       whisperPrompt: data.whisperPrompt || null,
+      deepgramModel: data.deepgramModel || "nova-2-phonecall",
+      deepgramLanguage: data.deepgramLanguage || "es-419",
+      deepgramKeywords: data.deepgramKeywords || [],
       silenceDurationMs: Math.min(data.silenceDurationMs ?? 600, 800), // Cap at 800ms max
       prefixPaddingMs: data.prefixPaddingMs ?? 300,
       temperature: data.temperature ?? 0.8,
@@ -685,8 +719,13 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente",
     greeting: null as string | null,
+    // STT settings
+    sttProvider: "deepgram" as "whisper" | "deepgram",
     whisperLanguage: "es",
     whisperPrompt: null as string | null,
+    deepgramModel: "nova-2-phonecall",
+    deepgramLanguage: "es-419",
+    deepgramKeywords: [] as string[],
     silenceDurationMs: 600,
     prefixPaddingMs: 300,
     temperature: 0.8,
@@ -848,12 +887,18 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     try {
       metrics.turnsCount++;
 
-      // === STT (Deepgram primary, Whisper fallback) ===
+      // === STT (respects agent's sttProvider setting) ===
       const sttStartTime = Date.now();
       const { text: userText, durationSec } = await transcribeAudio(
         pcmBuffer,
-        agentConfig.whisperLanguage,
-        agentConfig.whisperPrompt
+        {
+          sttProvider: agentConfig.sttProvider,
+          whisperLanguage: agentConfig.whisperLanguage,
+          whisperPrompt: agentConfig.whisperPrompt,
+          deepgramModel: agentConfig.deepgramModel,
+          deepgramLanguage: agentConfig.deepgramLanguage,
+          deepgramKeywords: agentConfig.deepgramKeywords,
+        }
       );
       const sttLatency = Date.now() - sttStartTime;
       metrics.latencies.turnEnd_to_stt.push(sttLatency);
