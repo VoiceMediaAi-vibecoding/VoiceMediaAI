@@ -507,7 +507,7 @@ async function generateLLMResponseStreaming(
 ): Promise<LLMResult> {
   const startTime = Date.now();
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
-  const recentHistory = conversationHistory.slice(-4);
+  const recentHistory = conversationHistory.slice(-6); // Keep more context for script adherence
 
   const messages: ChatMessage[] = [
     { role: 'system', content: truncatedPrompt },
@@ -524,8 +524,8 @@ async function generateLLMResponseStreaming(
     body: JSON.stringify({
       model: 'gpt-4o-mini',
       messages,
-      temperature,
-      max_tokens: 150,
+      temperature: temperature || 0.5, // Default to 0.5 for more consistent script adherence
+      max_tokens: 250, // Increased from 150 to allow complete script responses
       stream: true,
     }),
   });
@@ -599,11 +599,11 @@ async function generateLLMResponse(
   systemPrompt: string,
   conversationHistory: ChatMessage[],
   userMessage: string,
-  temperature: number = 0.7
+  temperature: number = 0.5 // Lowered from 0.7 for more consistent responses
 ): Promise<LLMResult> {
   const startTime = Date.now();
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
-  const recentHistory = conversationHistory.slice(-4);
+  const recentHistory = conversationHistory.slice(-6); // Keep more context
 
   const messages: ChatMessage[] = [
     { role: 'system', content: truncatedPrompt },
@@ -620,8 +620,8 @@ async function generateLLMResponse(
     body: JSON.stringify({
       model: 'gpt-4o-mini',
       messages,
-      temperature,
-      max_tokens: 150,
+      temperature: temperature || 0.5,
+      max_tokens: 250, // Increased from 150
     }),
   });
 
