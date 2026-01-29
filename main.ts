@@ -299,9 +299,6 @@ ${truncatedRules ? `[REGLAS Y RESTRICCIONES]\n${truncatedRules}` : ''}`.trim();
 function truncateSystemPrompt(prompt: string): string {
   return optimizeSystemPrompt(prompt);
 }
-  
-  return result;
-}
 
 // ============ TURN MANAGER ============
 interface TurnResult {
