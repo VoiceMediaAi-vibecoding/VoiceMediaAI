@@ -120,20 +120,22 @@ function writeString(view: DataView, offset: number, str: string): void {
 }
 
 // ============ SYSTEM PROMPT TRUNCATION ============
-// Aggressive truncation for fast LLM responses
-const MAX_SYSTEM_PROMPT_CHARS = 2000; // ~500 tokens for FAST responses
+// NOTE: A too-small limit makes the agent "ignore" the user's instructions.
+// Keep this generous, but still bounded for latency/cost control.
+const MAX_SYSTEM_PROMPT_CHARS = 8000;
+const SYSTEM_PROMPT_TAIL_CHARS = 2000; // keep the end too (often contains strict rules)
 
 function truncateSystemPrompt(prompt: string): string {
+  if (!prompt) return prompt;
   if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) return prompt;
-  
-  // Find a natural break point
-  const truncated = prompt.substring(0, MAX_SYSTEM_PROMPT_CHARS);
-  const lastPeriod = truncated.lastIndexOf('.');
-  const lastNewline = truncated.lastIndexOf('\n');
-  const breakPoint = Math.max(lastPeriod, lastNewline, MAX_SYSTEM_PROMPT_CHARS - 100);
-  
-  const result = prompt.substring(0, breakPoint + 1);
-  console.log(`[LLM] Truncated: ${prompt.length} -> ${result.length} chars`);
+
+  // Preserve the beginning AND the end. Many prompts place hard constraints at the end.
+  const headBudget = Math.max(0, MAX_SYSTEM_PROMPT_CHARS - SYSTEM_PROMPT_TAIL_CHARS);
+  const head = prompt.slice(0, headBudget);
+  const tail = prompt.slice(-SYSTEM_PROMPT_TAIL_CHARS);
+
+  const result = `${head}\n\n[...SYSTEM PROMPT TRUNCATED... ]\n\n${tail}`;
+  console.log(`[LLM] Truncated system prompt: ${prompt.length} -> ${result.length} chars (head=${head.length}, tail=${tail.length})`);
   return result;
 }
 
@@ -419,6 +421,9 @@ async function transcribeAudio(
   pcmBuffer: Int16Array,
   config: STTConfig
 ): Promise<{ text: string; durationSec: number }> {
+  if (config.sttProvider === 'deepgram' && !DEEPGRAM_API_KEY) {
+    console.warn('[STT] Deepgram selected but DEEPGRAM_API_KEY is missing; using Whisper fallback');
+  }
   // Use Deepgram if configured and API key available
   if (config.sttProvider === 'deepgram' && DEEPGRAM_API_KEY) {
     try {
