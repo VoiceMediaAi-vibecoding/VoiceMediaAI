@@ -120,22 +120,64 @@ function writeString(view: DataView, offset: number, str: string): void {
 }
 
 // ============ SYSTEM PROMPT TRUNCATION ============
-// NOTE: A too-small limit makes the agent "ignore" the user's instructions.
-// Keep this generous, but still bounded for latency/cost control.
-const MAX_SYSTEM_PROMPT_CHARS = 8000;
-const SYSTEM_PROMPT_TAIL_CHARS = 2000; // keep the end too (often contains strict rules)
+// IMPORTANT: The prompt contains the agent's "script" (FLUJO/PASOS).
+// We use smart truncation to preserve: HEAD + SCRIPT SECTION + TAIL
+const MAX_SYSTEM_PROMPT_CHARS = 16000; // ~4K tokens - generous for complex scripts
+const SYSTEM_PROMPT_HEAD_CHARS = 4000; // Intro, persona, context
+const SYSTEM_PROMPT_TAIL_CHARS = 4000; // Constraints, rules at the end
 
 function truncateSystemPrompt(prompt: string): string {
   if (!prompt) return prompt;
-  if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) return prompt;
+  if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) {
+    console.log(`[LLM] System prompt OK: ${prompt.length} chars (no truncation needed)`);
+    return prompt;
+  }
 
-  // Preserve the beginning AND the end. Many prompts place hard constraints at the end.
-  const headBudget = Math.max(0, MAX_SYSTEM_PROMPT_CHARS - SYSTEM_PROMPT_TAIL_CHARS);
-  const head = prompt.slice(0, headBudget);
+  // Try to find and preserve the SCRIPT/FLOW section
+  const scriptMarkers = ['FLUJO', 'SCRIPT', 'PASOS', 'PASO 1', 'PASO 2', '## Flujo', '## Script', 'CONVERSACIÓN'];
+  let scriptStart = -1;
+  let scriptEnd = -1;
+  
+  for (const marker of scriptMarkers) {
+    const idx = prompt.toUpperCase().indexOf(marker.toUpperCase());
+    if (idx !== -1 && (scriptStart === -1 || idx < scriptStart)) {
+      scriptStart = idx;
+    }
+  }
+  
+  // If we found a script section, try to find its end
+  if (scriptStart !== -1) {
+    // Look for next major section or take a generous chunk
+    const afterScript = prompt.slice(scriptStart);
+    const nextSectionMatch = afterScript.match(/\n##[^#]|\n---|\n===|\n\*\*\*|IMPORTANTE:|RESTRICCIONES:|REGLAS:/i);
+    if (nextSectionMatch && nextSectionMatch.index) {
+      scriptEnd = scriptStart + nextSectionMatch.index;
+    } else {
+      // Take up to 6000 chars of script
+      scriptEnd = Math.min(scriptStart + 6000, prompt.length);
+    }
+  }
+
+  // Build the truncated prompt
+  const head = prompt.slice(0, SYSTEM_PROMPT_HEAD_CHARS);
   const tail = prompt.slice(-SYSTEM_PROMPT_TAIL_CHARS);
-
-  const result = `${head}\n\n[...SYSTEM PROMPT TRUNCATED... ]\n\n${tail}`;
-  console.log(`[LLM] Truncated system prompt: ${prompt.length} -> ${result.length} chars (head=${head.length}, tail=${tail.length})`);
+  
+  let result: string;
+  
+  if (scriptStart !== -1 && scriptStart > SYSTEM_PROMPT_HEAD_CHARS) {
+    // We have a script section in the middle - preserve it
+    const scriptSection = prompt.slice(scriptStart, scriptEnd);
+    const scriptBudget = MAX_SYSTEM_PROMPT_CHARS - SYSTEM_PROMPT_HEAD_CHARS - SYSTEM_PROMPT_TAIL_CHARS - 100;
+    const truncatedScript = scriptSection.slice(0, scriptBudget);
+    
+    result = `${head}\n\n[...]\n\n${truncatedScript}\n\n[...]\n\n${tail}`;
+    console.log(`[LLM] Smart truncation: ${prompt.length} -> ${result.length} chars (head=${head.length}, script=${truncatedScript.length}, tail=${tail.length})`);
+  } else {
+    // Fallback: just head + tail
+    result = `${head}\n\n[... CONTENIDO INTERMEDIO OMITIDO PARA OPTIMIZAR LATENCIA ...]\n\n${tail}`;
+    console.log(`[LLM] Simple truncation: ${prompt.length} -> ${result.length} chars (head=${head.length}, tail=${tail.length})`);
+  }
+  
   return result;
 }
 
