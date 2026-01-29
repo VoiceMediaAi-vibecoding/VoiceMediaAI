@@ -348,18 +348,17 @@ interface LLMResult {
   outputTokens: number;
 }
 
-async function generateLLMResponse(
+// Streaming LLM that calls TTS as soon as we have a complete sentence
+async function generateLLMResponseStreaming(
   systemPrompt: string,
   conversationHistory: ChatMessage[],
   userMessage: string,
-  temperature: number = 0.7
+  temperature: number,
+  onFirstSentence: (sentence: string) => void,
+  shouldAbort: () => boolean
 ): Promise<LLMResult> {
   const startTime = Date.now();
-
-  // Aggressive truncation for speed
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
-
-  // Only keep last 4 messages for minimal context, maximum speed
   const recentHistory = conversationHistory.slice(-4);
 
   const messages: ChatMessage[] = [
@@ -378,7 +377,103 @@ async function generateLLMResponse(
       model: 'gpt-4o-mini',
       messages,
       temperature,
-      max_tokens: 150, // Very short for fast responses
+      max_tokens: 150,
+      stream: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Chat Completions error: ${response.status} - ${error}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let fullText = '';
+  let firstSentenceSent = false;
+  let buffer = '';
+
+  while (true) {
+    if (shouldAbort()) {
+      reader.cancel();
+      break;
+    }
+
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6);
+      if (data === '[DONE]') continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (delta) {
+          fullText += delta;
+
+          // Send first sentence to TTS immediately when we have punctuation
+          if (!firstSentenceSent) {
+            const sentenceEnd = fullText.match(/[.!?¡¿]/);
+            if (sentenceEnd && fullText.length >= 20) {
+              const firstSentence = fullText.trim();
+              console.log(`[LLM] First sentence ready in ${Date.now() - startTime}ms: "${firstSentence.substring(0, 40)}..."`);
+              onFirstSentence(firstSentence);
+              firstSentenceSent = true;
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore parse errors in stream
+      }
+    }
+  }
+
+  const elapsed = Date.now() - startTime;
+  // Estimate tokens (actual usage not available in streaming)
+  const inputTokens = Math.round((truncatedPrompt.length + userMessage.length) / 4);
+  const outputTokens = Math.round(fullText.length / 4);
+
+  console.log(`[LLM] Complete in ${elapsed}ms (~${inputTokens}+${outputTokens} tokens): "${fullText.substring(0, 50)}..."`);
+
+  return { text: fullText, inputTokens, outputTokens };
+}
+
+// Non-streaming fallback for simpler cases
+async function generateLLMResponse(
+  systemPrompt: string,
+  conversationHistory: ChatMessage[],
+  userMessage: string,
+  temperature: number = 0.7
+): Promise<LLMResult> {
+  const startTime = Date.now();
+  const truncatedPrompt = truncateSystemPrompt(systemPrompt);
+  const recentHistory = conversationHistory.slice(-4);
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: truncatedPrompt },
+    ...recentHistory,
+    { role: 'user', content: userMessage },
+  ];
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages,
+      temperature,
+      max_tokens: 150,
     }),
   });
 
@@ -659,7 +754,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     }
   }
 
-  // Process a complete user turn
+  // Process a complete user turn with streaming LLM + parallel TTS
   async function processTurn(pcmBuffer: Int16Array, turnDurationMs: number): Promise<void> {
     if (isProcessingTurn || isCallEnded) {
       console.log("[TURN] Already processing or call ended, skipping");
@@ -703,14 +798,31 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       conversationTranscript.push({ role: 'user', text: userText });
       conversationHistory.push({ role: 'user', content: userText });
 
-      // === LLM === (pass minimal history for speed)
+      // === STREAMING LLM + PARALLEL TTS ===
       const llmStartTime = Date.now();
-      const { text: assistantText, inputTokens, outputTokens } = await generateLLMResponse(
+      let ttsStarted = false;
+      let fullResponse = '';
+
+      const { text: assistantText, inputTokens, outputTokens } = await generateLLMResponseStreaming(
         agentConfig.systemPrompt,
-        conversationHistory.slice(-4), // Only last 4 messages
+        conversationHistory.slice(-4),
         userText,
-        agentConfig.temperature
+        agentConfig.temperature,
+        // Callback when first sentence is ready - start TTS immediately
+        (firstSentence: string) => {
+          if (!ttsStarted && currentPlaybackToken === twilioPlaybackToken && !isCallEnded) {
+            ttsStarted = true;
+            fullResponse = firstSentence;
+            // Fire TTS without awaiting - let it run in parallel with rest of LLM
+            streamElevenLabsTTS(firstSentence, currentPlaybackToken).catch(e => 
+              console.error("[TTS] Parallel TTS error:", e)
+            );
+          }
+        },
+        // Abort check
+        () => currentPlaybackToken !== twilioPlaybackToken || isCallEnded
       );
+
       const llmLatency = Date.now() - llmStartTime;
       metrics.latencies.stt_to_llm.push(llmLatency);
       metrics.llmInputTokens += inputTokens;
@@ -734,11 +846,13 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       conversationTranscript.push({ role: 'agent', text: assistantText });
       conversationHistory.push({ role: 'assistant', content: assistantText });
 
-      // === TTS ===
-      await streamElevenLabsTTS(assistantText, currentPlaybackToken);
+      // If TTS didn't start during streaming (short response), start it now
+      if (!ttsStarted) {
+        await streamElevenLabsTTS(assistantText, currentPlaybackToken);
+      }
 
       const totalLatency = Date.now() - turnEndTime;
-      console.log(`[LATENCY] Total turn: ${totalLatency}ms (STT: ${sttLatency}ms, LLM: ${llmLatency}ms)`);
+      console.log(`[LATENCY] Total turn: ${totalLatency}ms (STT: ${sttLatency}ms, LLM: ${llmLatency}ms, TTS started: ${ttsStarted ? 'parallel' : 'after LLM'})`);
 
     } catch (error) {
       console.error("[TURN] Processing error:", error);
