@@ -122,18 +122,17 @@ function writeString(view: DataView, offset: number, str: string): void {
   }
 }
 
-// ============ SYSTEM PROMPT TRUNCATION ============
-// IMPORTANT: The prompt contains the agent's "script" (FLUJO/PASOS).
-// We use smart truncation to preserve: HEAD + SCRIPT SECTION + TAIL
-// GPT-4o has 128K context window, so we can be MORE generous with prompts
-const MAX_SYSTEM_PROMPT_CHARS = 32000; // ~8K tokens - allow larger prompts for complex scripts
-const SYSTEM_PROMPT_HEAD_CHARS = 8000; // Intro, persona, context (doubled)
-const SYSTEM_PROMPT_TAIL_CHARS = 6000; // Constraints, rules at the end (increased)
-const SYSTEM_PROMPT_SCRIPT_CHARS = 12000; // Script section budget (doubled)
+// ============ SYSTEM PROMPT OPTIMIZATION ============
+// STRATEGY: Reorganize prompt so SCRIPT/FLUJO comes FIRST, then persona, then rules.
+// This maximizes script adherence even if we truncate later sections.
+// GPT-4o has 128K context, so 32K chars (~8K tokens) is very safe.
+const MAX_SYSTEM_PROMPT_CHARS = 32000;
+const PERSONA_BUDGET = 4000;   // Short intro/persona
+const SCRIPT_BUDGET = 16000;   // Main priority: the conversation flow
+const RULES_BUDGET = 6000;     // Restrictions, rules at the end
 
-// Log truncation settings once at startup so we can confirm which build is running.
 console.log(
-  `   Prompt truncation: MAX=${MAX_SYSTEM_PROMPT_CHARS}, HEAD=${SYSTEM_PROMPT_HEAD_CHARS}, SCRIPT=${SYSTEM_PROMPT_SCRIPT_CHARS}, TAIL=${SYSTEM_PROMPT_TAIL_CHARS}`,
+  `   Prompt optimization: MAX=${MAX_SYSTEM_PROMPT_CHARS}, PERSONA=${PERSONA_BUDGET}, SCRIPT=${SCRIPT_BUDGET}, RULES=${RULES_BUDGET}`,
 );
 
 // ============ FLOW STATE MANAGER (VAPI-STYLE) ============
@@ -206,10 +205,19 @@ const SCRIPT_REMINDER = `
 [RECORDATORIO FINAL]
 Sigue el flujo del script. Respuestas breves y naturales.`;
 
-function extractScriptSection(prompt: string): string | null {
-  const scriptMarkers = ['FLUJO', 'SCRIPT', 'PASOS', 'PASO 1', '## Flujo', '## Script', 'CONVERSACIÓN'];
-  let scriptStart = -1;
+// Helper: find section boundaries in the prompt
+function findSectionBoundaries(prompt: string): {
+  scriptStart: number;
+  scriptEnd: number;
+  rulesStart: number;
+} {
+  const scriptMarkers = ['FLUJO DE', 'FLUJO:', 'SCRIPT:', 'PASOS:', 'PASO 1', '## Flujo', '## Script', 'CONVERSACIÓN:', 'GUIÓN'];
+  const rulesMarkers = ['IMPORTANTE:', 'RESTRICCIONES:', 'REGLAS:', 'NUNCA:', 'NO DEBES', 'PROHIBIDO', 'LINEAMIENTOS', 'DIRECTRICES'];
   
+  let scriptStart = -1;
+  let rulesStart = -1;
+  
+  // Find earliest script marker
   for (const marker of scriptMarkers) {
     const idx = prompt.toUpperCase().indexOf(marker.toUpperCase());
     if (idx !== -1 && (scriptStart === -1 || idx < scriptStart)) {
@@ -217,72 +225,80 @@ function extractScriptSection(prompt: string): string | null {
     }
   }
   
-  if (scriptStart === -1) return null;
+  // Find earliest rules marker (should be after script)
+  for (const marker of rulesMarkers) {
+    const idx = prompt.toUpperCase().indexOf(marker.toUpperCase());
+    if (idx !== -1 && (rulesStart === -1 || idx < rulesStart)) {
+      // Only count if it's after script start
+      if (scriptStart === -1 || idx > scriptStart) {
+        rulesStart = idx;
+      }
+    }
+  }
   
-  // Extract ~2000 chars of the script for the reminder
-  const afterScript = prompt.slice(scriptStart);
-  const nextSectionMatch = afterScript.match(/\n##[^#]|\n---|\n===|\n\*\*\*|IMPORTANTE:|RESTRICCIONES:|REGLAS:/i);
-  const scriptEnd = nextSectionMatch?.index ? Math.min(nextSectionMatch.index, 2000) : 2000;
+  // Determine script end
+  let scriptEnd = prompt.length;
+  if (scriptStart !== -1) {
+    if (rulesStart !== -1 && rulesStart > scriptStart) {
+      scriptEnd = rulesStart;
+    } else {
+      // Look for section break
+      const afterScript = prompt.slice(scriptStart);
+      const breakMatch = afterScript.match(/\n##[^#]|\n---|\n===|\n\*\*\*/);
+      if (breakMatch?.index) {
+        scriptEnd = scriptStart + breakMatch.index;
+      }
+    }
+  }
   
-  return afterScript.slice(0, scriptEnd);
+  return { scriptStart, scriptEnd, rulesStart };
 }
 
-function truncateSystemPrompt(prompt: string): string {
+// Main function: reorganize and optimize the system prompt
+function optimizeSystemPrompt(prompt: string): string {
   if (!prompt) return prompt;
-  if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) {
-    console.log(`[LLM] System prompt OK: ${prompt.length} chars (no truncation needed)`);
-    return prompt;
-  }
-
-  // Try to find and preserve the SCRIPT/FLOW section
-  const scriptMarkers = ['FLUJO', 'SCRIPT', 'PASOS', 'PASO 1', 'PASO 2', '## Flujo', '## Script', 'CONVERSACIÓN'];
-  let scriptStart = -1;
-  let scriptEnd = -1;
   
-  for (const marker of scriptMarkers) {
-    const idx = prompt.toUpperCase().indexOf(marker.toUpperCase());
-    if (idx !== -1 && (scriptStart === -1 || idx < scriptStart)) {
-      scriptStart = idx;
+  const { scriptStart, scriptEnd, rulesStart } = findSectionBoundaries(prompt);
+  
+  // If no script section found, just truncate simply
+  if (scriptStart === -1) {
+    if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) {
+      console.log(`[LLM] Prompt OK (no script detected): ${prompt.length} chars`);
+      return prompt;
     }
+    const truncated = prompt.slice(0, MAX_SYSTEM_PROMPT_CHARS - 100) + '\n\n[... truncado ...]';
+    console.log(`[LLM] Simple truncation: ${prompt.length} -> ${truncated.length} chars`);
+    return truncated;
   }
   
-  // If we found a script section, try to find its end
-  if (scriptStart !== -1) {
-    // Look for next major section or take a generous chunk
-    const afterScript = prompt.slice(scriptStart);
-    const nextSectionMatch = afterScript.match(/\n##[^#]|\n---|\n===|\n\*\*\*|IMPORTANTE:|RESTRICCIONES:|REGLAS:/i);
-    if (nextSectionMatch && nextSectionMatch.index) {
-      scriptEnd = scriptStart + nextSectionMatch.index;
-    } else {
-      // Take up to SYSTEM_PROMPT_SCRIPT_CHARS chars of script (12K)
-      scriptEnd = Math.min(scriptStart + SYSTEM_PROMPT_SCRIPT_CHARS, prompt.length);
-    }
-  }
+  // Extract sections
+  const persona = prompt.slice(0, scriptStart).trim();
+  const script = prompt.slice(scriptStart, scriptEnd).trim();
+  const rules = rulesStart !== -1 ? prompt.slice(rulesStart).trim() : '';
+  
+  // Apply budgets
+  const truncatedPersona = persona.slice(0, PERSONA_BUDGET);
+  const truncatedScript = script.slice(0, SCRIPT_BUDGET);
+  const truncatedRules = rules.slice(0, RULES_BUDGET);
+  
+  // Build optimized prompt: SCRIPT FIRST, then persona context, then rules
+  const optimized = `[SCRIPT DE CONVERSACIÓN - PRIORIDAD MÁXIMA]
+${truncatedScript}
 
-  // Build the truncated prompt
-  const head = prompt.slice(0, SYSTEM_PROMPT_HEAD_CHARS);
-  const tail = prompt.slice(-SYSTEM_PROMPT_TAIL_CHARS);
+[CONTEXTO Y PERSONA]
+${truncatedPersona}
+
+${truncatedRules ? `[REGLAS Y RESTRICCIONES]\n${truncatedRules}` : ''}`.trim();
+
+  console.log(`[LLM] Prompt optimized: ${prompt.length} -> ${optimized.length} chars (script=${truncatedScript.length}, persona=${truncatedPersona.length}, rules=${truncatedRules.length})`);
   
-  let result: string;
-  
-  if (scriptStart !== -1 && scriptStart > SYSTEM_PROMPT_HEAD_CHARS) {
-    // We have a script section in the middle - preserve it
-    const scriptSection = prompt.slice(scriptStart, scriptEnd);
-    // Use dedicated script budget (12K) instead of calculating from remaining space
-    const truncatedScript = scriptSection.slice(0, SYSTEM_PROMPT_SCRIPT_CHARS);
-    
-    result = `${head}\n\n[...]\n\n${truncatedScript}\n\n[...]\n\n${tail}`;
-    console.log(`[LLM] Smart truncation: ${prompt.length} -> ${result.length} chars (head=${head.length}, script=${truncatedScript.length}, tail=${tail.length})`);
-  } else if (scriptStart !== -1 && scriptStart <= SYSTEM_PROMPT_HEAD_CHARS) {
-    // Script is within head section - just take more head + tail
-    const largerHead = prompt.slice(0, SYSTEM_PROMPT_HEAD_CHARS + SYSTEM_PROMPT_SCRIPT_CHARS);
-    result = `${largerHead}\n\n[...]\n\n${tail}`;
-    console.log(`[LLM] Script in head: ${prompt.length} -> ${result.length} chars (head+script=${largerHead.length}, tail=${tail.length})`);
-  } else {
-    // Fallback: just head + tail
-    result = `${head}\n\n[... CONTENIDO INTERMEDIO OMITIDO PARA OPTIMIZAR LATENCIA ...]\n\n${tail}`;
-    console.log(`[LLM] Simple truncation: ${prompt.length} -> ${result.length} chars (head=${head.length}, tail=${tail.length})`);
-  }
+  return optimized;
+}
+
+// Legacy function name for compatibility
+function truncateSystemPrompt(prompt: string): string {
+  return optimizeSystemPrompt(prompt);
+}
   
   return result;
 }
@@ -639,12 +655,15 @@ async function generateLLMResponseStreaming(
 
           // Send first sentence to TTS immediately when we have punctuation
           if (!firstSentenceSent) {
-            const sentenceEnd = fullText.match(/[.!?¡¿]/);
-            if (sentenceEnd && fullText.length >= 20) {
-              const firstSentence = fullText.trim();
-              console.log(`[LLM] First sentence ready in ${Date.now() - startTime}ms: "${firstSentence.substring(0, 40)}..."`);
-              onFirstSentence(firstSentence);
-              firstSentenceSent = true;
+            // Ignore opening punctuation (¿ ¡) as sentence terminators.
+            const endMatch = fullText.match(/[.!?]/);
+            if (endMatch?.index !== undefined && endMatch.index >= 10) {
+              const firstSentence = fullText.slice(0, endMatch.index + 1).trim();
+              if (firstSentence.length >= 20) {
+                console.log(`[LLM] First sentence ready in ${Date.now() - startTime}ms: "${firstSentence.substring(0, 40)}..."`);
+                onFirstSentence(firstSentence);
+                firstSentenceSent = true;
+              }
             }
           }
         }
@@ -1037,7 +1056,8 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       // === STREAMING LLM + PARALLEL TTS ===
       const llmStartTime = Date.now();
       let ttsStarted = false;
-      let fullResponse = '';
+      let firstSpokenText = '';
+      let firstTtsPromise: Promise<void> | null = null;
 
       const { text: assistantText, inputTokens, outputTokens } = await generateLLMResponseStreaming(
         agentConfig.systemPrompt,
@@ -1048,9 +1068,9 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
         (firstSentence: string) => {
           if (!ttsStarted && currentPlaybackToken === twilioPlaybackToken && !isCallEnded) {
             ttsStarted = true;
-            fullResponse = firstSentence;
+            firstSpokenText = firstSentence;
             // Fire TTS without awaiting - let it run in parallel with rest of LLM
-            streamElevenLabsTTS(firstSentence, currentPlaybackToken).catch(e => 
+            firstTtsPromise = streamElevenLabsTTS(firstSentence, currentPlaybackToken).catch(e => 
               console.error("[TTS] Parallel TTS error:", e)
             );
           }
@@ -1082,9 +1102,22 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
       conversationTranscript.push({ role: 'agent', text: assistantText });
       conversationHistory.push({ role: 'assistant', content: assistantText });
 
-      // If TTS didn't start during streaming (short response), start it now
+      // If TTS didn't start during streaming (short response), start it now.
+      // If it DID start, stream the remainder after the first chunk finishes.
       if (!ttsStarted) {
         await streamElevenLabsTTS(assistantText, currentPlaybackToken);
+      } else {
+        await (firstTtsPromise ?? Promise.resolve());
+
+        if (currentPlaybackToken === twilioPlaybackToken && !isCallEnded) {
+          const remainder = assistantText.startsWith(firstSpokenText)
+            ? assistantText.slice(firstSpokenText.length).trim()
+            : assistantText.trim();
+
+          if (remainder.length > 0) {
+            await streamElevenLabsTTS(remainder, currentPlaybackToken);
+          }
+        }
       }
 
       const totalLatency = Date.now() - turnEndTime;
