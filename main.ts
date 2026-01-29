@@ -125,9 +125,11 @@ function writeString(view: DataView, offset: number, str: string): void {
 // ============ SYSTEM PROMPT TRUNCATION ============
 // IMPORTANT: The prompt contains the agent's "script" (FLUJO/PASOS).
 // We use smart truncation to preserve: HEAD + SCRIPT SECTION + TAIL
-const MAX_SYSTEM_PROMPT_CHARS = 16000; // ~4K tokens - generous for complex scripts
-const SYSTEM_PROMPT_HEAD_CHARS = 4000; // Intro, persona, context
-const SYSTEM_PROMPT_TAIL_CHARS = 4000; // Constraints, rules at the end
+// GPT-4o has 128K context window, so we can be MORE generous with prompts
+const MAX_SYSTEM_PROMPT_CHARS = 32000; // ~8K tokens - allow larger prompts for complex scripts
+const SYSTEM_PROMPT_HEAD_CHARS = 8000; // Intro, persona, context (doubled)
+const SYSTEM_PROMPT_TAIL_CHARS = 6000; // Constraints, rules at the end (increased)
+const SYSTEM_PROMPT_SCRIPT_CHARS = 12000; // Script section budget (doubled)
 
 // ============ FLOW STATE MANAGER (VAPI-STYLE) ============
 // Detects conversation state and injects explicit instructions at the START of the system prompt
@@ -247,8 +249,8 @@ function truncateSystemPrompt(prompt: string): string {
     if (nextSectionMatch && nextSectionMatch.index) {
       scriptEnd = scriptStart + nextSectionMatch.index;
     } else {
-      // Take up to 6000 chars of script
-      scriptEnd = Math.min(scriptStart + 6000, prompt.length);
+      // Take up to SYSTEM_PROMPT_SCRIPT_CHARS chars of script (12K)
+      scriptEnd = Math.min(scriptStart + SYSTEM_PROMPT_SCRIPT_CHARS, prompt.length);
     }
   }
 
@@ -261,11 +263,16 @@ function truncateSystemPrompt(prompt: string): string {
   if (scriptStart !== -1 && scriptStart > SYSTEM_PROMPT_HEAD_CHARS) {
     // We have a script section in the middle - preserve it
     const scriptSection = prompt.slice(scriptStart, scriptEnd);
-    const scriptBudget = MAX_SYSTEM_PROMPT_CHARS - SYSTEM_PROMPT_HEAD_CHARS - SYSTEM_PROMPT_TAIL_CHARS - 100;
-    const truncatedScript = scriptSection.slice(0, scriptBudget);
+    // Use dedicated script budget (12K) instead of calculating from remaining space
+    const truncatedScript = scriptSection.slice(0, SYSTEM_PROMPT_SCRIPT_CHARS);
     
     result = `${head}\n\n[...]\n\n${truncatedScript}\n\n[...]\n\n${tail}`;
     console.log(`[LLM] Smart truncation: ${prompt.length} -> ${result.length} chars (head=${head.length}, script=${truncatedScript.length}, tail=${tail.length})`);
+  } else if (scriptStart !== -1 && scriptStart <= SYSTEM_PROMPT_HEAD_CHARS) {
+    // Script is within head section - just take more head + tail
+    const largerHead = prompt.slice(0, SYSTEM_PROMPT_HEAD_CHARS + SYSTEM_PROMPT_SCRIPT_CHARS);
+    result = `${largerHead}\n\n[...]\n\n${tail}`;
+    console.log(`[LLM] Script in head: ${prompt.length} -> ${result.length} chars (head+script=${largerHead.length}, tail=${tail.length})`);
   } else {
     // Fallback: just head + tail
     result = `${head}\n\n[... CONTENIDO INTERMEDIO OMITIDO PARA OPTIMIZAR LATENCIA ...]\n\n${tail}`;
