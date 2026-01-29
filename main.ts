@@ -1,6 +1,6 @@
-// ============= PIPELINE STT+LLM+TTS v6.0.0 =============
-// Replaces OpenAI Realtime API with batch STT + Chat Completions + streaming TTS
-// Cost reduction: ~97% (no audio tokens to OpenAI)
+// ============= PIPELINE STT+LLM+TTS v6.2.0 =============
+// Replaces OpenAI Realtime API with Deepgram STT + Chat Completions + streaming TTS
+// Cost reduction: ~97% (no audio tokens to OpenAI, Deepgram only for STT)
 
 import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 
@@ -13,8 +13,8 @@ const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Pipeline Relay Server v6.1.0 starting on port ${PORT}...`);
-console.log(`   Mode: STT (Deepgram/Whisper) + LLM (Chat Completions) + TTS (ElevenLabs)`);
+console.log(`🚀 Pipeline Relay Server v6.2.0 starting on port ${PORT}...`);
+console.log(`   Mode: STT (Deepgram) + LLM (Chat Completions) + TTS (ElevenLabs)`);
 console.log(`   DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY ? '✅ Configured (' + DEEPGRAM_API_KEY.substring(0, 8) + '...)' : '❌ MISSING'}`);
 console.log(`   OPENAI_API_KEY: ${OPENAI_API_KEY ? '✅ Configured' : '❌ MISSING'}`);
 console.log(`   ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ MISSING'}`);
@@ -129,14 +129,75 @@ const MAX_SYSTEM_PROMPT_CHARS = 16000; // ~4K tokens - generous for complex scri
 const SYSTEM_PROMPT_HEAD_CHARS = 4000; // Intro, persona, context
 const SYSTEM_PROMPT_TAIL_CHARS = 4000; // Constraints, rules at the end
 
-// Script reminder to inject before user messages - keeps the model on track
-const SCRIPT_REMINDER = `
-[RECORDATORIO IMPORTANTE]
-- Sigue ESTRICTAMENTE el flujo/script definido en tus instrucciones.
-- Después de obtener el nombre del cliente, continúa con el SIGUIENTE PASO del script.
-- No improvises ni te desvíes del flujo establecido.
-- Mantén respuestas breves y naturales para una conversación telefónica.
+// ============ FLOW STATE MANAGER (VAPI-STYLE) ============
+// Detects conversation state and injects explicit instructions at the START of the system prompt
+interface ChatMessageForFlow {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+function detectFlowState(conversationHistory: ChatMessageForFlow[]): string {
+  const userMessages = conversationHistory.filter(m => m.role === 'user');
+  const assistantMessages = conversationHistory.filter(m => m.role === 'assistant');
+  const turnCount = userMessages.length;
+  
+  const lastUserMessage = userMessages[userMessages.length - 1]?.content || '';
+  const lastAssistantMessage = assistantMessages[assistantMessages.length - 1]?.content || '';
+  
+  // Extract potential name from first user message (if it's short, likely just a name)
+  const possibleName = userMessages[0]?.content?.trim() || '';
+  const isLikelyName = possibleName.length < 50 && !possibleName.includes('?');
+  
+  // Estado inicial - greeting already sent, waiting for first user response
+  if (turnCount === 0) {
+    return '';  // No state injection needed, greeting handles this
+  }
+  
+  // After greeting, user responded (likely with their name)
+  if (turnCount === 1) {
+    const extractedName = isLikelyName ? possibleName.split(' ')[0] : 'el cliente';
+    return `[ESTADO ACTUAL DEL FLUJO]
+PASO 2: El cliente acaba de responder${isLikelyName ? ` (posible nombre: "${extractedName}")` : ''}.
+INSTRUCCIÓN: Continúa con el SIGUIENTE PASO de tu script. NO repitas el saludo.
+- Si obtuviste el nombre, confírmalo brevemente y avanza al siguiente paso del flujo.
+- Sigue las instrucciones de tu script para el PASO 2 (puede ser: confirmar interés, calificar, presentar oferta, etc.)
+- Mantén la respuesta CORTA y NATURAL para una llamada telefónica.
+
 `;
+  }
+  
+  // Turn 2+: Conversation in progress
+  if (turnCount === 2) {
+    return `[ESTADO ACTUAL DEL FLUJO]
+PASO 3: La conversación está en progreso. El cliente respondió: "${lastUserMessage.substring(0, 60)}${lastUserMessage.length > 60 ? '...' : ''}"
+INSTRUCCIÓN: Avanza al siguiente paso de tu script según la respuesta del cliente.
+- Responde a lo que dijo el cliente
+- Continúa con el flujo establecido
+- Mantén respuestas BREVES y naturales
+
+`;
+  }
+  
+  // Turn 3+: Deep in conversation
+  if (turnCount >= 3) {
+    return `[ESTADO ACTUAL DEL FLUJO]
+PASO ${turnCount + 1}: Conversación avanzada (${turnCount} intercambios realizados).
+INSTRUCCIÓN: Continúa siguiendo tu script. Si el cliente mostró interés, avanza hacia el cierre.
+- Responde a: "${lastUserMessage.substring(0, 40)}${lastUserMessage.length > 40 ? '...' : ''}"
+- Mantén el flujo del script
+- Respuestas CORTAS y directas
+
+`;
+  }
+  
+  return '';
+}
+
+// Script reminder (now less important since we inject state at the START)
+const SCRIPT_REMINDER = `
+
+[RECORDATORIO FINAL]
+Sigue el flujo del script. Respuestas breves y naturales.`;
 
 function extractScriptSection(prompt: string): string | null {
   const scriptMarkers = ['FLUJO', 'SCRIPT', 'PASOS', 'PASO 1', '## Flujo', '## Script', 'CONVERSACIÓN'];
@@ -440,81 +501,27 @@ async function transcribeWithDeepgram(
   return { text: transcript, durationSec };
 }
 
-// Fallback to Whisper if Deepgram fails or is not configured
-async function transcribeWithWhisper(
-  pcmBuffer: Int16Array,
-  language: string,
-  prompt?: string | null
-): Promise<{ text: string; durationSec: number }> {
-  const startTime = Date.now();
-  const wavBuffer = createWavBuffer(pcmBuffer, 8000);
-  const durationSec = pcmBuffer.length / 8000;
-
-  const formData = new FormData();
-  formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
-  formData.append('model', 'whisper-1');
-
-  if (language && language !== 'auto') {
-    formData.append('language', language);
-  }
-  if (prompt) {
-    formData.append('prompt', prompt);
-  }
-
-  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: formData,
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Whisper API error: ${response.status} - ${error}`);
-  }
-
-  const result = await response.json();
-  const elapsed = Date.now() - startTime;
-  console.log(`[STT] Whisper fallback: "${result.text.substring(0, 60)}..." (${durationSec.toFixed(1)}s audio, ${elapsed}ms latency)`);
-
-  return { text: result.text, durationSec };
-}
-
-// STT configuration interface
+// STT configuration interface (Deepgram only)
 interface STTConfig {
-  sttProvider: 'whisper' | 'deepgram';
-  whisperLanguage: string;
-  whisperPrompt: string | null;
   deepgramModel: string;
   deepgramLanguage: string;
   deepgramKeywords: string[];
 }
 
-// Smart STT function: Uses agent's configured provider
+// STT function: Uses Deepgram only
 async function transcribeAudio(
   pcmBuffer: Int16Array,
   config: STTConfig
 ): Promise<{ text: string; durationSec: number }> {
-  if (config.sttProvider === 'deepgram' && !DEEPGRAM_API_KEY) {
-    console.warn('[STT] Deepgram selected but DEEPGRAM_API_KEY is missing; using Whisper fallback');
-  }
-  // Use Deepgram if configured and API key available
-  if (config.sttProvider === 'deepgram' && DEEPGRAM_API_KEY) {
-    try {
-      return await transcribeWithDeepgram(pcmBuffer, {
-        model: config.deepgramModel,
-        language: config.deepgramLanguage,
-        keywords: config.deepgramKeywords,
-      });
-    } catch (error) {
-      console.error('[STT] Deepgram failed, falling back to Whisper:', error);
-      return await transcribeWithWhisper(pcmBuffer, config.whisperLanguage, config.whisperPrompt);
-    }
+  if (!DEEPGRAM_API_KEY) {
+    throw new Error('[STT] DEEPGRAM_API_KEY is required but not configured');
   }
   
-  // Use Whisper
-  return await transcribeWithWhisper(pcmBuffer, config.whisperLanguage, config.whisperPrompt);
+  return await transcribeWithDeepgram(pcmBuffer, {
+    model: config.deepgramModel,
+    language: config.deepgramLanguage,
+    keywords: config.deepgramKeywords,
+  });
 }
 
 // ============ LLM CHAT COMPLETIONS ============
@@ -542,12 +549,26 @@ async function generateLLMResponseStreaming(
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
   const recentHistory = conversationHistory.slice(-6); // Keep more context for script adherence
 
-  // Inject script reminder to keep model on track (only after first exchange)
-  const shouldInjectReminder = recentHistory.length >= 2;
-  const reminderPrefix = shouldInjectReminder ? SCRIPT_REMINDER : '';
+  // === FLOW STATE INJECTION (VAPI-style) ===
+  // Inject explicit flow state at the START of the system prompt
+  const flowState = detectFlowState(recentHistory);
+  const enhancedSystemPrompt = flowState + truncatedPrompt + SCRIPT_REMINDER;
+  
+  // === DYNAMIC MODEL SELECTION ===
+  // Use GPT-4o for very long prompts (better at following complex instructions)
+  const useGpt4o = truncatedPrompt.length > 10000;
+  const model = useGpt4o ? 'gpt-4o' : 'gpt-4o-mini';
+  
+  if (useGpt4o) {
+    console.log(`[LLM] Using GPT-4o (prompt ${truncatedPrompt.length} chars > 10K threshold)`);
+  }
+  
+  if (flowState) {
+    console.log(`[LLM] Flow state injected: "${flowState.substring(0, 80).replace(/\n/g, ' ')}..."`);
+  }
   
   const messages: ChatMessage[] = [
-    { role: 'system', content: truncatedPrompt + reminderPrefix },
+    { role: 'system', content: enhancedSystemPrompt },
     ...recentHistory,
     { role: 'user', content: userMessage },
   ];
@@ -559,7 +580,7 @@ async function generateLLMResponseStreaming(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
+      model,
       messages,
       temperature: temperature || 0.5, // Default to 0.5 for more consistent script adherence
       max_tokens: 250, // Increased from 150 to allow complete script responses
@@ -642,12 +663,16 @@ async function generateLLMResponse(
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
   const recentHistory = conversationHistory.slice(-6); // Keep more context
 
-  // Inject script reminder to keep model on track (only after first exchange)
-  const shouldInjectReminder = recentHistory.length >= 2;
-  const reminderPrefix = shouldInjectReminder ? SCRIPT_REMINDER : '';
+  // === FLOW STATE INJECTION (VAPI-style) ===
+  const flowState = detectFlowState(recentHistory);
+  const enhancedSystemPrompt = flowState + truncatedPrompt + SCRIPT_REMINDER;
+  
+  // === DYNAMIC MODEL SELECTION ===
+  const useGpt4o = truncatedPrompt.length > 10000;
+  const model = useGpt4o ? 'gpt-4o' : 'gpt-4o-mini';
 
   const messages: ChatMessage[] = [
-    { role: 'system', content: truncatedPrompt + reminderPrefix },
+    { role: 'system', content: enhancedSystemPrompt },
     ...recentHistory,
     { role: 'user', content: userMessage },
   ];
@@ -659,7 +684,7 @@ async function generateLLMResponse(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
+      model,
       messages,
       temperature: temperature || 0.5,
       max_tokens: 250, // Increased from 150
@@ -682,12 +707,12 @@ async function generateLLMResponse(
   return { text, inputTokens, outputTokens };
 }
 
-// ============ PRICING (NEW PIPELINE) ============
+// ============ PRICING (NEW PIPELINE - DEEPGRAM ONLY) ============
 const PRICING = {
-  WHISPER_PER_MINUTE: 0.006,        // $0.006/min
-  GPT4O_MINI_INPUT: 0.00000015,     // $0.15/1M tokens
-  GPT4O_MINI_OUTPUT: 0.0000006,     // $0.60/1M tokens
-  ELEVENLABS_PER_CHAR: 0.00003,     // ~$30/1M chars
+  DEEPGRAM_PER_MINUTE: 0.0043,       // $0.0043/min (Nova-2)
+  GPT4O_MINI_INPUT: 0.00000015,      // $0.15/1M tokens
+  GPT4O_MINI_OUTPUT: 0.0000006,      // $0.60/1M tokens
+  ELEVENLABS_PER_CHAR: 0.00003,      // ~$30/1M chars
 };
 
 interface CallMetrics {
@@ -704,7 +729,7 @@ interface CallMetrics {
 }
 
 function calculatePipelineCost(metrics: CallMetrics): number {
-  const sttCost = (metrics.sttDurationSec / 60) * PRICING.WHISPER_PER_MINUTE;
+  const sttCost = (metrics.sttDurationSec / 60) * PRICING.DEEPGRAM_PER_MINUTE;
   const llmInputCost = metrics.llmInputTokens * PRICING.GPT4O_MINI_INPUT;
   const llmOutputCost = metrics.llmOutputTokens * PRICING.GPT4O_MINI_OUTPUT;
   const ttsCost = metrics.ttsCharacters * PRICING.ELEVENLABS_PER_CHAR;
@@ -721,14 +746,11 @@ async function loadAgentConfig(agentId: string) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente Virtual",
     greeting: null as string | null,
-    // STT settings
-    sttProvider: "deepgram" as "whisper" | "deepgram",
-    whisperLanguage: "es",
-    whisperPrompt: null as string | null,
+    // STT settings (Deepgram only)
     deepgramModel: "nova-2-phonecall",
     deepgramLanguage: "es-419",
     deepgramKeywords: [] as string[],
-    silenceDurationMs: 600, // Reduced default for faster response
+    silenceDurationMs: 600,
     prefixPaddingMs: 300,
     temperature: 0.8,
   };
@@ -753,10 +775,9 @@ async function loadAgentConfig(agentId: string) {
       return defaultConfig;
     }
 
-    const sttProvider = data.sttProvider || 'deepgram';
     console.log(`✅ Loaded agent: ${data.name} (${data.id})`);
     console.log(`   Voice: ElevenLabs ${data.elevenlabsVoiceId || 'default'}`);
-    console.log(`   STT: ${sttProvider} (${sttProvider === 'deepgram' ? data.deepgramModel : 'whisper-1'})`);
+    console.log(`   STT: Deepgram (${data.deepgramModel || 'nova-2-phonecall'})`);
     console.log(`   Greeting: ${data.greeting?.substring(0, 60) || 'none'}...`);
 
     return {
@@ -767,14 +788,11 @@ async function loadAgentConfig(agentId: string) {
       elevenlabsModel: data.elevenlabsModel || "eleven_turbo_v2_5",
       name: data.name || defaultConfig.name,
       greeting: data.greeting || null,
-      // STT settings
-      sttProvider: sttProvider as "whisper" | "deepgram",
-      whisperLanguage: data.whisperLanguage || "es",
-      whisperPrompt: data.whisperPrompt || null,
+      // STT settings (Deepgram only)
       deepgramModel: data.deepgramModel || "nova-2-phonecall",
       deepgramLanguage: data.deepgramLanguage || "es-419",
       deepgramKeywords: data.deepgramKeywords || [],
-      silenceDurationMs: Math.min(data.silenceDurationMs ?? 600, 800), // Cap at 800ms max
+      silenceDurationMs: Math.min(data.silenceDurationMs ?? 600, 800),
       prefixPaddingMs: data.prefixPaddingMs ?? 300,
       temperature: data.temperature ?? 0.8,
     };
@@ -807,10 +825,7 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     elevenlabsModel: "eleven_turbo_v2_5",
     name: "Asistente",
     greeting: null as string | null,
-    // STT settings
-    sttProvider: "deepgram" as "whisper" | "deepgram",
-    whisperLanguage: "es",
-    whisperPrompt: null as string | null,
+    // STT settings (Deepgram only)
     deepgramModel: "nova-2-phonecall",
     deepgramLanguage: "es-419",
     deepgramKeywords: [] as string[],
@@ -975,14 +990,11 @@ function handleWebSocket(socket: WebSocket, urlParams: UrlParams) {
     try {
       metrics.turnsCount++;
 
-      // === STT (respects agent's sttProvider setting) ===
+      // === STT (Deepgram only) ===
       const sttStartTime = Date.now();
       const { text: userText, durationSec } = await transcribeAudio(
         pcmBuffer,
         {
-          sttProvider: agentConfig.sttProvider,
-          whisperLanguage: agentConfig.whisperLanguage,
-          whisperPrompt: agentConfig.whisperPrompt,
           deepgramModel: agentConfig.deepgramModel,
           deepgramLanguage: agentConfig.deepgramLanguage,
           deepgramKeywords: agentConfig.deepgramKeywords,
@@ -1273,8 +1285,9 @@ Deno.serve({ port: PORT }, async (req) => {
   if (url.pathname === "/health") {
     return new Response(JSON.stringify({ 
       status: "ok", 
-      version: "6.0.0",
+      version: "6.2.0",
       mode: "STT+LLM+TTS Pipeline",
+      features: ["flow-state-manager", "dynamic-model-selection"],
     }), { headers: { "Content-Type": "application/json" } });
   }
 
@@ -1288,8 +1301,8 @@ Deno.serve({ port: PORT }, async (req) => {
     return response;
   }
 
-  return new Response("Pipeline Relay Server v6.0.0 - STT+LLM+TTS", { status: 200 });
+  return new Response("Pipeline Relay Server v6.2.0 - STT+LLM+TTS + Flow State Manager", { status: 200 });
 });
 
-console.log(`✅ Pipeline Relay Server v6.0.0 running on port ${PORT}`);
-console.log(`   No OpenAI Realtime API - 97% cost reduction`);
+console.log(`✅ Pipeline Relay Server v6.2.0 running on port ${PORT}`);
+console.log(`   Flow State Manager + Dynamic Model Selection enabled`);
