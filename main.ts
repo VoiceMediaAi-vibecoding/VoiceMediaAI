@@ -1,4 +1,4 @@
-// ============= PIPELINE STT+LLM+TTS v6.2.0 =============
+// ============= PIPELINE STT+LLM+TTS v6.2.1 =============
 // Replaces OpenAI Realtime API with Deepgram STT + Chat Completions + streaming TTS
 // Cost reduction: ~97% (no audio tokens to OpenAI, Deepgram only for STT)
 
@@ -13,7 +13,7 @@ const RELAY_SHARED_SECRET = Deno.env.get("RELAY_SHARED_SECRET");
 
 const PORT = parseInt(Deno.env.get("PORT") || "8080");
 
-console.log(`🚀 Pipeline Relay Server v6.2.0 starting on port ${PORT}...`);
+console.log(`🚀 Pipeline Relay Server v6.2.1 starting on port ${PORT}...`);
 console.log(`   Mode: STT (Deepgram) + LLM (Chat Completions) + TTS (ElevenLabs)`);
 console.log(`   DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY ? '✅ Configured (' + DEEPGRAM_API_KEY.substring(0, 8) + '...)' : '❌ MISSING'}`);
 console.log(`   OPENAI_API_KEY: ${OPENAI_API_KEY ? '✅ Configured' : '❌ MISSING'}`);
@@ -130,6 +130,11 @@ const MAX_SYSTEM_PROMPT_CHARS = 32000; // ~8K tokens - allow larger prompts for 
 const SYSTEM_PROMPT_HEAD_CHARS = 8000; // Intro, persona, context (doubled)
 const SYSTEM_PROMPT_TAIL_CHARS = 6000; // Constraints, rules at the end (increased)
 const SYSTEM_PROMPT_SCRIPT_CHARS = 12000; // Script section budget (doubled)
+
+// Log truncation settings once at startup so we can confirm which build is running.
+console.log(
+  `   Prompt truncation: MAX=${MAX_SYSTEM_PROMPT_CHARS}, HEAD=${SYSTEM_PROMPT_HEAD_CHARS}, SCRIPT=${SYSTEM_PROMPT_SCRIPT_CHARS}, TAIL=${SYSTEM_PROMPT_TAIL_CHARS}`,
+);
 
 // ============ FLOW STATE MANAGER (VAPI-STYLE) ============
 // Detects conversation state and injects explicit instructions at the START of the system prompt
