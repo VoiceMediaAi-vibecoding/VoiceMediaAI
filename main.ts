@@ -126,6 +126,36 @@ const MAX_SYSTEM_PROMPT_CHARS = 16000; // ~4K tokens - generous for complex scri
 const SYSTEM_PROMPT_HEAD_CHARS = 4000; // Intro, persona, context
 const SYSTEM_PROMPT_TAIL_CHARS = 4000; // Constraints, rules at the end
 
+// Script reminder to inject before user messages - keeps the model on track
+const SCRIPT_REMINDER = `
+[RECORDATORIO IMPORTANTE]
+- Sigue ESTRICTAMENTE el flujo/script definido en tus instrucciones.
+- Después de obtener el nombre del cliente, continúa con el SIGUIENTE PASO del script.
+- No improvises ni te desvíes del flujo establecido.
+- Mantén respuestas breves y naturales para una conversación telefónica.
+`;
+
+function extractScriptSection(prompt: string): string | null {
+  const scriptMarkers = ['FLUJO', 'SCRIPT', 'PASOS', 'PASO 1', '## Flujo', '## Script', 'CONVERSACIÓN'];
+  let scriptStart = -1;
+  
+  for (const marker of scriptMarkers) {
+    const idx = prompt.toUpperCase().indexOf(marker.toUpperCase());
+    if (idx !== -1 && (scriptStart === -1 || idx < scriptStart)) {
+      scriptStart = idx;
+    }
+  }
+  
+  if (scriptStart === -1) return null;
+  
+  // Extract ~2000 chars of the script for the reminder
+  const afterScript = prompt.slice(scriptStart);
+  const nextSectionMatch = afterScript.match(/\n##[^#]|\n---|\n===|\n\*\*\*|IMPORTANTE:|RESTRICCIONES:|REGLAS:/i);
+  const scriptEnd = nextSectionMatch?.index ? Math.min(nextSectionMatch.index, 2000) : 2000;
+  
+  return afterScript.slice(0, scriptEnd);
+}
+
 function truncateSystemPrompt(prompt: string): string {
   if (!prompt) return prompt;
   if (prompt.length <= MAX_SYSTEM_PROMPT_CHARS) {
@@ -509,8 +539,12 @@ async function generateLLMResponseStreaming(
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
   const recentHistory = conversationHistory.slice(-6); // Keep more context for script adherence
 
+  // Inject script reminder to keep model on track (only after first exchange)
+  const shouldInjectReminder = recentHistory.length >= 2;
+  const reminderPrefix = shouldInjectReminder ? SCRIPT_REMINDER : '';
+  
   const messages: ChatMessage[] = [
-    { role: 'system', content: truncatedPrompt },
+    { role: 'system', content: truncatedPrompt + reminderPrefix },
     ...recentHistory,
     { role: 'user', content: userMessage },
   ];
@@ -605,8 +639,12 @@ async function generateLLMResponse(
   const truncatedPrompt = truncateSystemPrompt(systemPrompt);
   const recentHistory = conversationHistory.slice(-6); // Keep more context
 
+  // Inject script reminder to keep model on track (only after first exchange)
+  const shouldInjectReminder = recentHistory.length >= 2;
+  const reminderPrefix = shouldInjectReminder ? SCRIPT_REMINDER : '';
+
   const messages: ChatMessage[] = [
-    { role: 'system', content: truncatedPrompt },
+    { role: 'system', content: truncatedPrompt + reminderPrefix },
     ...recentHistory,
     { role: 'user', content: userMessage },
   ];
